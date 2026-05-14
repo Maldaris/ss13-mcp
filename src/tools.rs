@@ -85,6 +85,19 @@ pub struct ListAreasParams {
     pub prefix: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ValidateRulesParams {
+    /// Optional: only run rules matching this ID prefix
+    pub filter: Option<String>,
+    /// Maximum violations to return (default 100)
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListRulesParams {
+    // No params needed, but struct required for the tool macro
+}
+
 // ── Tool implementations ─────────────────────────────────────────────
 
 /// The MCP tool handler. Holds a reference to the loaded map state and the tool router.
@@ -305,6 +318,117 @@ impl MapTools {
             result.push_str(&format!("  {} (×{})\n", path, count));
         }
         result
+    }
+
+    /// Run all JS validation rules against the loaded map.
+    #[tool(description = "Run JavaScript validation rules against the loaded map. Returns violations grouped by severity.")]
+    fn validate_rules(&self, Parameters(params): Parameters<ValidateRulesParams>) -> String {
+        let engine = match &self.state.rule_engine {
+            Some(e) => e,
+            None => return "No rules directory configured. Use --rules <dir> to specify a rules directory.".into(),
+        };
+
+        let result = match engine.evaluate(&self.state.index) {
+            Ok(r) => r,
+            Err(e) => return format!("Rule evaluation failed: {}", e),
+        };
+
+        let limit = params.limit.unwrap_or(100);
+
+        let mut violations = result.violations;
+
+        // Apply filter if specified
+        if let Some(filter) = &params.filter {
+            violations.retain(|v| v.rule_id.starts_with(filter.as_str()));
+        }
+
+        let total_violations = violations.len();
+
+        let mut output = format!(
+            "Validation complete: {} rules evaluated, {} anchors checked, {} violations\n",
+            result.rules_evaluated, result.anchors_checked, total_violations
+        );
+
+        if !result.errors.is_empty() {
+            output.push_str(&format!("\n{} errors during evaluation:\n", result.errors.len()));
+            for err in &result.errors {
+                output.push_str(&format!("  ⚠ {}\n", err));
+            }
+        }
+
+        if violations.is_empty() {
+            output.push_str("\n✅ No violations found.\n");
+            return output;
+        }
+
+        // Group by severity
+        let errors: Vec<_> = violations.iter().filter(|v| v.severity == "error").collect();
+        let warnings: Vec<_> = violations.iter().filter(|v| v.severity == "warning").collect();
+        let infos: Vec<_> = violations.iter().filter(|v| v.severity == "info").collect();
+
+        if !errors.is_empty() {
+            output.push_str(&format!("\n❌ {} errors:\n", errors.len()));
+            for (i, v) in errors.iter().enumerate() {
+                if i >= limit { 
+                    output.push_str(&format!("  ... and {} more\n", errors.len() - limit));
+                    break; 
+                }
+                output.push_str(&format!("  ({},{},{}) [{}] {}: {}\n",
+                    v.x, v.y, v.z, v.rule_id, v.anchor_path, v.message));
+            }
+        }
+
+        if !warnings.is_empty() {
+            output.push_str(&format!("\n⚠️ {} warnings:\n", warnings.len()));
+            for (i, v) in warnings.iter().enumerate() {
+                if i >= limit {
+                    output.push_str(&format!("  ... and {} more\n", warnings.len() - limit));
+                    break;
+                }
+                output.push_str(&format!("  ({},{},{}) [{}] {}: {}\n",
+                    v.x, v.y, v.z, v.rule_id, v.anchor_path, v.message));
+            }
+        }
+
+        if !infos.is_empty() {
+            output.push_str(&format!("\nℹ️ {} info:\n", infos.len()));
+            for (i, v) in infos.iter().enumerate() {
+                if i >= limit {
+                    output.push_str(&format!("  ... and {} more\n", infos.len() - limit));
+                    break;
+                }
+                output.push_str(&format!("  ({},{},{}) [{}] {}: {}\n",
+                    v.x, v.y, v.z, v.rule_id, v.anchor_path, v.message));
+            }
+        }
+
+        output
+    }
+
+    /// List available JS rule files and their rule definitions.
+    #[tool(description = "List available JavaScript rule files in the rules directory")]
+    fn list_rules(&self, Parameters(_params): Parameters<ListRulesParams>) -> String {
+        let engine = match &self.state.rule_engine {
+            Some(e) => e,
+            None => return "No rules directory configured. Use --rules <dir> to specify a rules directory.".into(),
+        };
+
+        let files = match engine.discover_rule_files() {
+            Ok(f) => f,
+            Err(e) => return format!("Failed to scan rules directory: {}", e),
+        };
+
+        if files.is_empty() {
+            return "No .js rule files found in rules directory.".into();
+        }
+
+        let mut output = format!("{} rule files found:\n", files.len());
+        for file in &files {
+            let name = file.file_name().unwrap_or_default().to_string_lossy();
+            let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            output.push_str(&format!("  {} ({} bytes)\n", name, size));
+        }
+        output
     }
 }
 

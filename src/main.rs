@@ -9,6 +9,7 @@
 //!   ss13-map-mcp --dme path/to/tgstation.dme --dmm path/to/_maps/map_files/Station.dmm
 
 mod index;
+mod rules;
 mod state;
 mod tools;
 
@@ -21,6 +22,7 @@ use rmcp::ServiceExt;
 struct Args {
     dme_path: PathBuf,
     dmm_path: PathBuf,
+    rules_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -28,6 +30,7 @@ fn parse_args() -> Result<Args> {
 
     let mut dme_path = None;
     let mut dmm_path = None;
+    let mut rules_dir = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -40,14 +43,19 @@ fn parse_args() -> Result<Args> {
                 i += 1;
                 dmm_path = Some(PathBuf::from(&args[i]));
             }
+            "--rules" => {
+                i += 1;
+                rules_dir = Some(PathBuf::from(&args[i]));
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: ss13-map-mcp --dme <path/to/tgstation.dme> --dmm <path/to/station.dmm>");
+                eprintln!("Usage: ss13-map-mcp --dme <path/to/tgstation.dme> --dmm <path/to/station.dmm> [--rules <dir>]");
                 eprintln!();
                 eprintln!("MCP server for SS13 map intelligence. Communicates over stdio.");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  --dme <path>  Path to the .dme environment file");
-                eprintln!("  --dmm <path>  Path to the .dmm map file to load");
+                eprintln!("  --dme <path>    Path to the .dme environment file");
+                eprintln!("  --dmm <path>    Path to the .dmm map file to load");
+                eprintln!("  --rules <dir>   Directory containing .js rule files (default: _maps/rules/ relative to .dme)");
                 std::process::exit(0);
             }
             other => {
@@ -60,6 +68,7 @@ fn parse_args() -> Result<Args> {
     Ok(Args {
         dme_path: dme_path.ok_or_else(|| anyhow::anyhow!("Missing --dme argument"))?,
         dmm_path: dmm_path.ok_or_else(|| anyhow::anyhow!("Missing --dmm argument"))?,
+        rules_dir,
     })
 }
 
@@ -73,7 +82,7 @@ async fn main() -> Result<()> {
     let args = parse_args()?;
 
     // Load environment and map
-    let server_state = state::ServerState::load(&args.dme_path, &args.dmm_path)?;
+    let server_state = state::ServerState::load(&args.dme_path, &args.dmm_path, args.rules_dir)?;
     let state = Arc::new(server_state);
 
     tracing::info!("Starting MCP server over stdio...");
