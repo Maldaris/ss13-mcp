@@ -37,6 +37,26 @@ pub struct ServerState {
     pub rule_engine: Option<RuleEngine>,
 }
 
+/// A single placement in a batch operation.
+pub struct BatchPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub type_path: String,
+    pub vars: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    pub replace: Option<String>,
+}
+
+/// Result of a single placement in a batch.
+pub struct BatchResult {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub type_path: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
 /// Mutable map data — the map grid + spatial index, protected by RwLock.
 pub struct MapData {
     /// The parsed map data
@@ -51,8 +71,9 @@ pub struct MapData {
 
 impl MapData {
     /// Place a prefab on a tile at (x, y, z).
-    /// Adds the prefab to the tile's content list.
-    /// Returns the new dictionary key for the tile.
+    /// For turfs: replaces the existing turf (a tile has exactly one turf).
+    /// For areas: replaces the existing area (a tile has exactly one area).
+    /// For objs/mobs: adds to the tile's content list.
     pub fn place_prefab(&mut self, x: i32, y: i32, z: i32, prefab: Prefab) -> Result<(), String> {
         let raw = self.grid_index(x, y, z)?;
 
@@ -64,8 +85,24 @@ impl MapData {
             .cloned()
             .unwrap_or_default();
 
-        // Build the new prefab list: insert the new prefab at the right layer position
         let mut new_prefabs = current_prefabs;
+
+        // If placing a turf or area, remove any existing one of the same layer
+        let new_layer = layer_priority(&prefab.path);
+        if new_layer <= 1 {
+            // Turf (1) or area (0) — remove existing of same layer
+            let removed: Vec<Prefab> = new_prefabs.iter()
+                .filter(|p| layer_priority(&p.path) == new_layer)
+                .cloned()
+                .collect();
+            new_prefabs.retain(|p| layer_priority(&p.path) != new_layer);
+            // Update spatial index for removed items
+            for r in &removed {
+                self.index.remove_object(x, y, z, r);
+            }
+        }
+
+        // Insert at the right layer position
         let insert_pos = find_layer_position(&new_prefabs, &prefab.path);
         new_prefabs.insert(insert_pos, prefab.clone());
 
@@ -80,6 +117,41 @@ impl MapData {
 
         self.dirty = true;
         Ok(())
+    }
+
+    /// Place multiple prefabs in a single operation.
+    /// Returns a summary of successes and failures.
+    pub fn place_batch(&mut self, placements: Vec<BatchPlacement>, objtree: &ObjectTree) -> Vec<BatchResult> {
+        let mut results = Vec::with_capacity(placements.len());
+        for p in placements {
+            // Handle replace first
+            if let Some(ref replace_path) = p.replace {
+                let _ = self.remove_prefab(p.x, p.y, p.z, replace_path);
+            }
+
+            // Build prefab with optional vars
+            let prefab = if let Some(ref vars) = p.vars {
+                build_prefab(&p.type_path, vars, objtree)
+            } else {
+                Prefab::from_path(p.type_path.clone())
+            };
+
+            match self.place_prefab(p.x, p.y, p.z, prefab) {
+                Ok(()) => results.push(BatchResult {
+                    x: p.x, y: p.y, z: p.z,
+                    type_path: p.type_path,
+                    ok: true,
+                    error: None,
+                }),
+                Err(e) => results.push(BatchResult {
+                    x: p.x, y: p.y, z: p.z,
+                    type_path: p.type_path,
+                    ok: false,
+                    error: Some(e),
+                }),
+            }
+        }
+        results
     }
 
     /// Remove the first prefab matching a type path from a tile.

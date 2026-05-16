@@ -163,6 +163,28 @@ pub struct RemoveObjectParams {
     pub type_path: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchPlacementParam {
+    /// X coordinate (1-based)
+    pub x: i32,
+    /// Y coordinate (1-based)
+    pub y: i32,
+    /// Z level (default 1)
+    pub z: Option<i32>,
+    /// Type path of the prefab to place
+    pub type_path: String,
+    /// Optional variable overrides as JSON object
+    pub vars: Option<serde_json::Map<String, serde_json::Value>>,
+    /// If set, removes the first object matching this type path before placing
+    pub replace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlaceBatchParams {
+    /// Array of placements to make in a single operation
+    pub placements: Vec<BatchPlacementParam>,
+}
+
 // ── Tool implementations (static base tools) ─────────────────────────
 
 /// Internal struct that holds just the static tool router.
@@ -678,6 +700,45 @@ impl StaticTools {
             Ok(false) => format!("⚠ '{}' not found at ({},{},{})", params.type_path, params.x, params.y, z),
             Err(e) => format!("❌ Remove failed: {}", e),
         }
+    }
+
+    /// Place multiple objects in a single batch operation.
+    #[tool(description = "Place multiple objects on map tiles in one call. Each placement has x, y, z, type_path, optional vars, and optional replace. Much more efficient than individual place_prefab calls. Returns a summary of results.")]
+    async fn place_batch(&self, Parameters(params): Parameters<PlaceBatchParams>) -> String {
+        let placements: Vec<crate::state::BatchPlacement> = params.placements.into_iter().map(|p| {
+            let vars = p.vars.map(|vm| {
+                let mut map = std::collections::BTreeMap::new();
+                for (k, v) in vm { map.insert(k, v); }
+                map
+            });
+            crate::state::BatchPlacement {
+                x: p.x,
+                y: p.y,
+                z: p.z.unwrap_or(1),
+                type_path: p.type_path,
+                vars,
+                replace: p.replace,
+            }
+        }).collect();
+
+        let count = placements.len();
+        let mut map_data = self.state.map_data.write().await;
+        let results = map_data.place_batch(placements, &self.state.objtree);
+
+        let ok_count = results.iter().filter(|r| r.ok).count();
+        let fail_count = count - ok_count;
+
+        let mut output = format!("Batch: {}/{} placed successfully", ok_count, count);
+        if fail_count > 0 {
+            output.push_str(&format!("\n❌ {} failures:", fail_count));
+            for r in &results {
+                if !r.ok {
+                    output.push_str(&format!("\n  ({},{},{}) {} — {}",
+                        r.x, r.y, r.z, r.type_path, r.error.as_deref().unwrap_or("unknown")));
+                }
+            }
+        }
+        output
     }
 }
 
