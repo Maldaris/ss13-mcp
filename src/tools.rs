@@ -98,6 +98,30 @@ pub struct ListRulesParams {
     // No params needed, but struct required for the tool macro
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RenderRegionParams {
+    /// Left X coordinate (1-based, inclusive)
+    pub x1: usize,
+    /// Bottom Y coordinate (1-based, inclusive)
+    pub y1: usize,
+    /// Right X coordinate (1-based, inclusive)
+    pub x2: usize,
+    /// Top Y coordinate (1-based, inclusive)
+    pub y2: usize,
+    /// Z level (default 1)
+    pub z: Option<usize>,
+    /// Render pass filter: "pipes", "cables", "pipes-and-cables", or comma-separated pass names. Default shows everything.
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RenderAreaParams {
+    /// Area type path (e.g. "/area/station/engineering/main")
+    pub area_path: String,
+    /// Render pass filter: "pipes", "cables", "pipes-and-cables", or comma-separated pass names. Default shows everything.
+    pub filter: Option<String>,
+}
+
 // ── Tool implementations ─────────────────────────────────────────────
 
 /// The MCP tool handler. Holds a reference to the loaded map state and the tool router.
@@ -429,6 +453,94 @@ impl MapTools {
             output.push_str(&format!("  {} ({} bytes)\n", name, size));
         }
         output
+    }
+
+    /// Render a rectangular region of the map as a PNG image.
+    #[tool(description = "Render a rectangular region of the map to a PNG image. Returns base64-encoded PNG. Coordinates are 1-based. Use filter for layer-specific views: 'pipes', 'cables', 'pipes-and-cables'.")]
+    fn render_region(&self, Parameters(params): Parameters<RenderRegionParams>) -> String {
+        let z = params.z.unwrap_or(1);
+        let filter = params.filter.as_deref();
+
+        // Sanity check region size — cap at 64x64 tiles (2048x2048 px) to prevent OOM
+        let width = params.x2.saturating_sub(params.x1) + 1;
+        let height = params.y2.saturating_sub(params.y1) + 1;
+        if width > 64 || height > 64 {
+            return format!(
+                "Region too large: {}x{} tiles (max 64x64). Use smaller bounds or render_area for auto-bounded areas.",
+                width, height
+            );
+        }
+
+        match crate::render::render_region(
+            &self.state,
+            params.x1,
+            params.y1,
+            params.x2,
+            params.y2,
+            z,
+            filter,
+        ) {
+            Ok(result) => {
+                let mut output = format!(
+                    "Rendered region ({},{}) to ({},{}) z={}: {}x{} px ({}x{} tiles)\n",
+                    params.x1, params.y1, params.x2, params.y2, z,
+                    result.width_px, result.height_px,
+                    result.width_tiles, result.height_tiles,
+                );
+                if !result.icon_errors.is_empty() {
+                    output.push_str(&format!(
+                        "\n⚠ {} icon errors (missing sprites):\n",
+                        result.icon_errors.len()
+                    ));
+                    for (i, err) in result.icon_errors.iter().enumerate() {
+                        if i >= 10 {
+                            output.push_str(&format!("  ... and {} more\n", result.icon_errors.len() - 10));
+                            break;
+                        }
+                        output.push_str(&format!("  {}\n", err));
+                    }
+                }
+                output.push_str("\n[IMAGE:base64]\n");
+                output.push_str(&result.base64_png);
+                output
+            }
+            Err(e) => format!("Render failed: {}", e),
+        }
+    }
+
+    /// Render an area of the map as a PNG image, auto-bounded to the area's extent.
+    #[tool(description = "Render all tiles of a specific area as a PNG image. Automatically finds the area's bounding box and adds 1-tile padding. Use filter for layer-specific views.")]
+    fn render_area(&self, Parameters(params): Parameters<RenderAreaParams>) -> String {
+        let filter = params.filter.as_deref();
+
+        match crate::render::render_area(&self.state, &params.area_path, filter) {
+            Ok(Some(result)) => {
+                let mut output = format!(
+                    "Rendered area '{}': {}x{} px ({}x{} tiles)\n",
+                    params.area_path,
+                    result.width_px, result.height_px,
+                    result.width_tiles, result.height_tiles,
+                );
+                if !result.icon_errors.is_empty() {
+                    output.push_str(&format!(
+                        "\n⚠ {} icon errors (missing sprites):\n",
+                        result.icon_errors.len()
+                    ));
+                    for (i, err) in result.icon_errors.iter().enumerate() {
+                        if i >= 10 {
+                            output.push_str(&format!("  ... and {} more\n", result.icon_errors.len() - 10));
+                            break;
+                        }
+                        output.push_str(&format!("  {}\n", err));
+                    }
+                }
+                output.push_str("\n[IMAGE:base64]\n");
+                output.push_str(&result.base64_png);
+                output
+            }
+            Ok(None) => format!("Area '{}' not found on the map", params.area_path),
+            Err(e) => format!("Render failed: {}", e),
+        }
     }
 }
 

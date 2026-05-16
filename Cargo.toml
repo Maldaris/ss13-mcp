@@ -6,8 +6,10 @@ description = "MCP server for SS13 map intelligence — spatial queries, validat
 
 [dependencies]
 # SpacemanDMM crates (DM parser + map tools)
-dreammaker = { git = "https://github.com/SpaceManiac/SpacemanDMM", branch = "master" }
-dmm-tools = { git = "https://github.com/SpaceManiac/SpacemanDMM", branch = "master" }
+# Using local patched copy — fixes smoothing_flags constant mismatch with current tgstation.
+# TG moved SMOOTH_BITMASK from bit 1 to bit 0; upstream SpacemanDMM still has old layout.
+dreammaker = { path = "spacemandmm-patched/crates/dreammaker" }
+dmm-tools = { path = "spacemandmm-patched/crates/dmm-tools", features = ["png"] }
 
 # MCP protocol
 rmcp = { version = "0.16", features = ["server"] }
@@ -30,6 +32,10 @@ tracing-subscriber = "0.3"
 # Spatial indexing
 foldhash = "0.2"
 indexmap = "2"
+
+# Rendering support
+base64 = "0.22"
+bumpalo = { version = "3", features = ["collections"] }
 
 # Embedded JavaScript engine for rule DSL
 rquickjs = { version = "0.11", features = ["full-async", "parallel"] }

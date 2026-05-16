@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/builtins-proc-macro",
+    "crates/dap-types",
+    "crates/dm-langserver",
+    "crates/dmdoc",
+    "crates/dmm-tools",
+    "crates/dmm-tools-cli",
+    "crates/dreamchecker",
+    "crates/dreammaker",
+    "crates/interval-tree",
+    #"crates/spaceman-dmm",
+]
+
+[workspace.package]
+version = "1.11.0"
+authors = ["Tad Hardesty <tad@platymuus.com>"]
+edition = "2021"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = true
+codegen-units = 1
