@@ -135,6 +135,34 @@ pub struct SaveMapParams {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlacePrefabParams {
+    /// X coordinate (1-based)
+    pub x: i32,
+    /// Y coordinate (1-based)
+    pub y: i32,
+    /// Z level (default 1)
+    pub z: Option<i32>,
+    /// Type path of the prefab to place (e.g. "/obj/structure/table")
+    pub type_path: String,
+    /// Optional variable overrides as JSON object (e.g. {"name": "My Table", "anchored": 1})
+    pub vars: Option<serde_json::Map<String, serde_json::Value>>,
+    /// If set, removes the first object matching this type path before placing
+    pub replace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoveObjectParams {
+    /// X coordinate (1-based)
+    pub x: i32,
+    /// Y coordinate (1-based)
+    pub y: i32,
+    /// Z level (default 1)
+    pub z: Option<i32>,
+    /// Type path of the object to remove (first exact match)
+    pub type_path: String,
+}
+
 // ── Tool implementations (static base tools) ─────────────────────────
 
 /// Internal struct that holds just the static tool router.
@@ -588,6 +616,67 @@ impl StaticTools {
                 )
             }
             Err(e) => format!("❌ Save failed: {}", e),
+        }
+    }
+
+    /// Place a prefab directly on a map tile.
+    #[tool(description = "Place an object on a map tile. Provide a type path and optional var overrides. Use 'replace' to swap an existing object. Vars support: strings, numbers, paths (/obj/...), lists ([1,2,3]), null.")]
+    async fn place_prefab(&self, Parameters(params): Parameters<PlacePrefabParams>) -> String {
+        let z = params.z.unwrap_or(1);
+
+        // Build the prefab
+        let mut vars = std::collections::BTreeMap::new();
+        if let Some(var_map) = params.vars {
+            for (k, v) in var_map {
+                vars.insert(k, v);
+            }
+        }
+        let prefab = crate::state::build_prefab(&params.type_path, &vars, &self.state.objtree);
+        let prefab_str = format!("{}", prefab);
+
+        let mut map_data = self.state.map_data.write().await;
+
+        // Validate bounds
+        let (dim_x, dim_y, dim_z) = (map_data.index.dim_x, map_data.index.dim_y, map_data.index.dim_z);
+        if params.x < 1 || params.x > dim_x as i32 || params.y < 1 || params.y > dim_y as i32 || z < 1 || z > dim_z as i32 {
+            return format!("❌ Coordinates ({},{},{}) out of bounds ({}x{}x{})",
+                params.x, params.y, z, dim_x, dim_y, dim_z);
+        }
+
+        // Remove replacement if specified
+        let mut replaced = false;
+        if let Some(rp) = &params.replace {
+            match map_data.remove_prefab(params.x, params.y, z, rp) {
+                Ok(true) => { replaced = true; },
+                Ok(false) => {
+                    return format!("⚠ Replace target '{}' not found at ({},{},{})", rp, params.x, params.y, z);
+                }
+                Err(e) => return format!("❌ Remove failed: {}", e),
+            }
+        }
+
+        match map_data.place_prefab(params.x, params.y, z, prefab) {
+            Ok(()) => {
+                let mut output = format!("✅ Placed at ({},{},{}): {}", params.x, params.y, z, prefab_str);
+                if replaced {
+                    output.push_str(&format!("\n  Replaced: {}", params.replace.unwrap()));
+                }
+                output
+            }
+            Err(e) => format!("❌ Placement failed: {}", e),
+        }
+    }
+
+    /// Remove an object from a map tile.
+    #[tool(description = "Remove the first object matching a type path from a tile.")]
+    async fn remove_object(&self, Parameters(params): Parameters<RemoveObjectParams>) -> String {
+        let z = params.z.unwrap_or(1);
+        let mut map_data = self.state.map_data.write().await;
+
+        match map_data.remove_prefab(params.x, params.y, z, &params.type_path) {
+            Ok(true) => format!("✅ Removed '{}' from ({},{},{})", params.type_path, params.x, params.y, z),
+            Ok(false) => format!("⚠ '{}' not found at ({},{},{})", params.type_path, params.x, params.y, z),
+            Err(e) => format!("❌ Remove failed: {}", e),
         }
     }
 }
