@@ -8,6 +8,7 @@
 //! Usage:
 //!   ss13-map-mcp --dme path/to/tgstation.dme --dmm path/to/_maps/map_files/Station.dmm
 
+mod builder;
 mod index;
 mod render;
 mod rules;
