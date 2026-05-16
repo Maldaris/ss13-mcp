@@ -39,3 +39,4 @@ bumpalo = { version = "3", features = ["collections"] }
 
 # Embedded JavaScript engine for rule DSL
 rquickjs = { version = "0.11", features = ["full-async", "parallel"] }
+ndarray = "0.15"

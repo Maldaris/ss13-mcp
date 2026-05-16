@@ -1,5 +1,6 @@
 //! Server state — holds the parsed environment, spatial index, rule engine, and renderer.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use anyhow::Result;
 use dmm_tools::dmm::{Map, Prefab, Key};
@@ -8,6 +9,7 @@ use dreammaker::ast::Ident;
 use dreammaker::config::MapRenderer;
 use dreammaker::constants::Constant;
 use dreammaker::objtree::ObjectTree;
+use ndarray::Array3;
 use tokio::sync::RwLock;
 
 use crate::index::SpatialIndex;
@@ -58,9 +60,20 @@ pub struct BatchResult {
 }
 
 /// Mutable map data — the map grid + spatial index, protected by RwLock.
+///
+/// EDITING MODEL: We never mutate `map.dictionary` in place — that's read-only
+/// after initial load. All edits go into `tile_overrides`, which maps raw grid
+/// indices to fully-resolved prefab lists. On `save()`, we walk the entire grid,
+/// resolve each tile (override or original), and build a fresh Map with a freshly-
+/// deduped dictionary. This avoids any risk of corrupting unrelated grid cells
+/// via shared dictionary keys.
 pub struct MapData {
-    /// The parsed map data
+    /// The parsed map data (dictionary + grid as loaded — treated as immutable)
     pub map: Map,
+
+    /// Per-tile overrides — fully resolved prefab list for tiles we've edited.
+    /// Key is raw grid index (z, y, x). On read, override > dictionary lookup.
+    pub tile_overrides: HashMap<(usize, usize, usize), Vec<Prefab>>,
 
     /// The spatial index built from the map
     pub index: SpatialIndex,
@@ -70,6 +83,15 @@ pub struct MapData {
 }
 
 impl MapData {
+    /// Get the current prefab list at a raw grid index, considering overrides.
+    fn prefabs_at_raw(&self, raw: (usize, usize, usize)) -> Vec<Prefab> {
+        if let Some(over) = self.tile_overrides.get(&raw) {
+            return over.clone();
+        }
+        let key = self.map.grid[raw];
+        self.map.dictionary.get(&key).cloned().unwrap_or_default()
+    }
+
     /// Place a prefab on a tile at (x, y, z).
     /// For turfs: replaces the existing turf (a tile has exactly one turf).
     /// For areas: replaces the existing area (a tile has exactly one area).
@@ -77,15 +99,8 @@ impl MapData {
     pub fn place_prefab(&mut self, x: i32, y: i32, z: i32, prefab: Prefab) -> Result<(), String> {
         let raw = self.grid_index(x, y, z)?;
 
-        // Get current key at this position
-        let current_key = self.map.grid[raw];
-
-        // Get the current prefab list for this tile
-        let current_prefabs = self.map.dictionary.get(&current_key)
-            .cloned()
-            .unwrap_or_default();
-
-        let mut new_prefabs = current_prefabs;
+        // Resolve current prefab list (override > dictionary)
+        let mut new_prefabs = self.prefabs_at_raw(raw);
 
         // If placing a turf or area, remove any existing one of the same layer
         let new_layer = layer_priority(&prefab.path);
@@ -106,17 +121,31 @@ impl MapData {
         let insert_pos = find_layer_position(&new_prefabs, &prefab.path);
         new_prefabs.insert(insert_pos, prefab.clone());
 
-        // Find or create a dictionary key for this prefab list
-        let new_key = self.find_or_create_key(new_prefabs);
-
-        // Update the grid
-        self.map.grid[raw] = new_key;
+        // Store as override — the authoritative copy of this tile's contents.
+        // We also update map.dictionary + map.grid for the renderer's benefit,
+        // but only by APPENDING fresh keys — never modifying existing entries.
+        self.tile_overrides.insert(raw, new_prefabs.clone());
+        self.sync_tile_to_map(raw, new_prefabs);
 
         // Update the spatial index
         self.index.add_object(x, y, z, prefab);
 
         self.dirty = true;
         Ok(())
+    }
+
+    /// Mirror an override into `self.map` so the renderer sees current state.
+    /// SAFETY: This only APPENDS new dictionary entries at max+1. It never
+    /// modifies existing entries. The grid cell is updated to the new key.
+    /// Orphaned dictionary entries are tolerated — they'll be cleaned up at save.
+    fn sync_tile_to_map(&mut self, raw: (usize, usize, usize), prefabs: Vec<Prefab>) {
+        let next_key = self.map.dictionary.keys()
+            .max()
+            .map(|k| k.next())
+            .unwrap_or_else(Key::default);
+        self.map.dictionary.insert(next_key, prefabs);
+        self.map.grid[raw] = next_key;
+        // adjust_key_length will be called on save; renderer doesn't need it
     }
 
     /// Place multiple prefabs in a single operation.
@@ -158,18 +187,14 @@ impl MapData {
     /// Returns true if a prefab was removed.
     pub fn remove_prefab(&mut self, x: i32, y: i32, z: i32, type_path: &str) -> Result<bool, String> {
         let raw = self.grid_index(x, y, z)?;
-
-        let current_key = self.map.grid[raw];
-        let mut prefabs = self.map.dictionary.get(&current_key)
-            .cloned()
-            .unwrap_or_default();
+        let mut prefabs = self.prefabs_at_raw(raw);
 
         // Find and remove the first matching prefab
         let pos = prefabs.iter().position(|p| p.path == type_path);
         if let Some(idx) = pos {
             let removed = prefabs.remove(idx);
-            let new_key = self.find_or_create_key(prefabs);
-            self.map.grid[raw] = new_key;
+            self.tile_overrides.insert(raw, prefabs.clone());
+            self.sync_tile_to_map(raw, prefabs);
             self.index.remove_object(x, y, z, &removed);
             self.dirty = true;
             Ok(true)
@@ -181,17 +206,13 @@ impl MapData {
     /// Replace the first prefab matching a type path with a new prefab on a tile.
     pub fn replace_prefab(&mut self, x: i32, y: i32, z: i32, old_path: &str, new_prefab: Prefab) -> Result<bool, String> {
         let raw = self.grid_index(x, y, z)?;
-
-        let current_key = self.map.grid[raw];
-        let mut prefabs = self.map.dictionary.get(&current_key)
-            .cloned()
-            .unwrap_or_default();
+        let mut prefabs = self.prefabs_at_raw(raw);
 
         let pos = prefabs.iter().position(|p| p.path == old_path);
         if let Some(idx) = pos {
             let old = std::mem::replace(&mut prefabs[idx], new_prefab.clone());
-            let new_key = self.find_or_create_key(prefabs);
-            self.map.grid[raw] = new_key;
+            self.tile_overrides.insert(raw, prefabs.clone());
+            self.sync_tile_to_map(raw, prefabs);
             self.index.remove_object(x, y, z, &old);
             self.index.add_object(x, y, z, new_prefab);
             self.dirty = true;
@@ -202,9 +223,62 @@ impl MapData {
     }
 
     /// Save the map to a file.
+    ///
+    /// Strategy: rebuild the dictionary + grid from scratch by walking every
+    /// tile in the original grid, resolving overrides, and deduping into a
+    /// fresh dictionary keyed 0..N. This is the only safe way to write — any
+    /// attempt to mutate `map.dictionary` in place risks corrupting unrelated
+    /// tiles that share keys.
     pub fn save(&mut self, path: &Path) -> Result<(), String> {
+        use std::collections::BTreeMap;
+
+        let (dim_x, dim_y, dim_z) = self.map.dim_xyz();
+
+        // Build a fresh dictionary: prefab list → new Key
+        // Use a fingerprint (formatted string) for deduplication to avoid any
+        // reliance on `PartialEq for Prefab` (which we suspect of misbehaving).
+        let mut dedup: HashMap<String, Key> = HashMap::new();
+        let mut new_dict: BTreeMap<Key, Vec<Prefab>> = BTreeMap::new();
+        let mut keygen = KeyGen::new();
+
+        let mut new_grid: Array3<Key> = Array3::default((dim_z, dim_y, dim_x));
+
+        for z in 0..dim_z {
+            for y in 0..dim_y {
+                for x in 0..dim_x {
+                    let raw = (z, y, x);
+                    let prefabs: Vec<Prefab> = if let Some(over) = self.tile_overrides.get(&raw) {
+                        over.clone()
+                    } else {
+                        let orig_key = self.map.grid[raw];
+                        self.map.dictionary.get(&orig_key).cloned().unwrap_or_default()
+                    };
+
+                    let fingerprint = fingerprint_prefabs(&prefabs);
+                    let key = if let Some(&k) = dedup.get(&fingerprint) {
+                        k
+                    } else {
+                        let k = keygen.take();
+                        dedup.insert(fingerprint, k);
+                        new_dict.insert(k, prefabs);
+                        k
+                    };
+                    new_grid[raw] = key;
+                }
+            }
+        }
+
+        // Swap the freshly-built dictionary + grid into self.map
+        self.map.dictionary = new_dict;
+        self.map.grid = new_grid;
         self.map.adjust_key_length();
+
+        // Write to disk
         self.map.to_file(path).map_err(|e| format!("Failed to save map: {}", e))?;
+
+        // After a successful save, the on-disk file is the source of truth.
+        // The overrides have been folded into the dictionary, so clear them.
+        self.tile_overrides.clear();
         self.dirty = false;
         Ok(())
     }
@@ -222,24 +296,45 @@ impl MapData {
         Ok((z as usize - 1, dim_y - y as usize, x as usize - 1))
     }
 
-    /// Find an existing dictionary key with the exact same prefab list,
-    /// or create a new one.
-    fn find_or_create_key(&mut self, prefabs: Vec<Prefab>) -> Key {
-        // Search existing dictionary for a match
-        for (&key, existing) in &self.map.dictionary {
-            if *existing == prefabs {
-                return key;
+}
+
+/// Build a stable, deterministic fingerprint for a prefab list. Used as a
+/// dedup key during save — two tiles with the same fingerprint share a Key.
+///
+/// The fingerprint sorts var entries so that the same prefab written in
+/// different var orders hashes identically.
+fn fingerprint_prefabs(prefabs: &[Prefab]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for p in prefabs {
+        s.push_str(&p.path);
+        if !p.vars.is_empty() {
+            let mut vars: Vec<_> = p.vars.iter().collect();
+            vars.sort_by(|a, b| a.0.cmp(b.0));
+            s.push('{');
+            for (k, v) in vars {
+                let _ = write!(s, "{}={};", k, v);
             }
+            s.push('}');
         }
+        s.push('\u{1F}');  // unit separator
+    }
+    s
+}
 
-        // No match — create a new key
-        let next_key = self.map.dictionary.keys()
-            .max()
-            .map(|k| k.next())
-            .unwrap_or(Key::invalid()); // shouldn't happen
+/// Sequential key generator — yields Key(0), Key(1), Key(2), ...
+struct KeyGen {
+    next: Key,
+}
 
-        self.map.dictionary.insert(next_key, prefabs);
-        next_key
+impl KeyGen {
+    fn new() -> Self {
+        KeyGen { next: Key::default() }
+    }
+    fn take(&mut self) -> Key {
+        let k = self.next;
+        self.next = self.next.next();
+        k
     }
 }
 
@@ -437,6 +532,7 @@ impl ServerState {
             objtree,
             map_data: RwLock::new(MapData {
                 map,
+                tile_overrides: HashMap::new(),
                 index,
                 dirty: false,
             }),

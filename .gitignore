@@ -1,3 +1,4 @@
 /target
 Cargo.lock
 spacemandmm-patched/
+.agent-lock
