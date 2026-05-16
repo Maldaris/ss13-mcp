@@ -530,9 +530,9 @@ impl StaticTools {
 
     /// Render a rectangular region of the map as a PNG image.
     #[tool(description = "Render a rectangular region of the map to a PNG image. Returns base64-encoded PNG. Coordinates are 1-based. Use filter for layer-specific views: 'pipes', 'cables', 'pipes-and-cables'.")]
-    fn render_region(&self, Parameters(params): Parameters<RenderRegionParams>) -> String {
+    async fn render_region(&self, Parameters(params): Parameters<RenderRegionParams>) -> String {
         let z = params.z.unwrap_or(1);
-        let filter = params.filter.as_deref();
+        let filter_owned = params.filter.clone();
 
         // Sanity check region size — cap at 64x64 tiles (2048x2048 px) to prevent OOM
         let width = params.x2.saturating_sub(params.x1) + 1;
@@ -544,19 +544,25 @@ impl StaticTools {
             );
         }
 
-        match crate::render::render_region(
-            &self.state,
-            params.x1,
-            params.y1,
-            params.x2,
-            params.y2,
-            z,
-            filter,
-        ) {
-            Ok(result) => {
+        let state = self.state.clone();
+        let x1 = params.x1;
+        let y1 = params.y1;
+        let x2 = params.x2;
+        let y2 = params.y2;
+
+        let result = tokio::task::spawn_blocking(move || {
+            crate::render::render_region(
+                &state,
+                x1, y1, x2, y2, z,
+                filter_owned.as_deref(),
+            )
+        }).await;
+
+        match result {
+            Ok(Ok(result)) => {
                 let mut output = format!(
                     "Rendered region ({},{}) to ({},{}) z={}: {}x{} px ({}x{} tiles)\n",
-                    params.x1, params.y1, params.x2, params.y2, z,
+                    x1, y1, x2, y2, z,
                     result.width_px, result.height_px,
                     result.width_tiles, result.height_tiles,
                 );
@@ -577,17 +583,24 @@ impl StaticTools {
                 output.push_str(&result.base64_png);
                 output
             }
-            Err(e) => format!("Render failed: {}", e),
+            Ok(Err(e)) => format!("Render failed: {}", e),
+            Err(e) => format!("Render task panicked: {}", e),
         }
     }
 
     /// Render an area of the map as a PNG image, auto-bounded to the area's extent.
     #[tool(description = "Render all tiles of a specific area as a PNG image. Automatically finds the area's bounding box and adds 1-tile padding. Use filter for layer-specific views.")]
-    fn render_area(&self, Parameters(params): Parameters<RenderAreaParams>) -> String {
-        let filter = params.filter.as_deref();
+    async fn render_area(&self, Parameters(params): Parameters<RenderAreaParams>) -> String {
+        let state = self.state.clone();
+        let area_path = params.area_path.clone();
+        let filter_owned = params.filter.clone();
 
-        match crate::render::render_area(&self.state, &params.area_path, filter) {
-            Ok(Some(result)) => {
+        let result = tokio::task::spawn_blocking(move || {
+            crate::render::render_area(&state, &area_path, filter_owned.as_deref())
+        }).await;
+
+        match result {
+            Ok(Ok(Some(result))) => {
                 let mut output = format!(
                     "Rendered area '{}': {}x{} px ({}x{} tiles)\n",
                     params.area_path,
@@ -611,8 +624,9 @@ impl StaticTools {
                 output.push_str(&result.base64_png);
                 output
             }
-            Ok(None) => format!("Area '{}' not found on the map", params.area_path),
-            Err(e) => format!("Render failed: {}", e),
+            Ok(Ok(None)) => format!("Area '{}' not found on the map", params.area_path),
+            Ok(Err(e)) => format!("Render failed: {}", e),
+            Err(e) => format!("Render task panicked: {}", e),
         }
     }
 
