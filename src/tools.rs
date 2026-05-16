@@ -129,6 +129,12 @@ pub struct RenderAreaParams {
     pub filter: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SaveMapParams {
+    /// Output file path. If omitted, overwrites the loaded map file.
+    pub path: Option<String>,
+}
+
 // ── Tool implementations (static base tools) ─────────────────────────
 
 /// Internal struct that holds just the static tool router.
@@ -151,9 +157,10 @@ impl StaticTools {
 impl StaticTools {
     /// Query all objects at a specific tile coordinate.
     #[tool(description = "Get all objects at a specific (x, y, z) tile on the map")]
-    fn query_tile(&self, Parameters(params): Parameters<QueryTileParams>) -> String {
+    async fn query_tile(&self, Parameters(params): Parameters<QueryTileParams>) -> String {
         let z = params.z.unwrap_or(1);
-        let objects = self.state.index.at(params.x, params.y, z);
+        let map_data = self.state.map_data.read().await;
+        let objects = map_data.index.at(params.x, params.y, z);
 
         if objects.is_empty() {
             return format!("No objects at ({}, {}, {})", params.x, params.y, z);
@@ -168,8 +175,9 @@ impl StaticTools {
 
     /// List all areas on the map, optionally filtered by prefix.
     #[tool(description = "List all area paths on the map, optionally filtered by a path prefix")]
-    fn list_areas(&self, Parameters(params): Parameters<ListAreasParams>) -> String {
-        let mut areas = self.state.index.all_areas();
+    async fn list_areas(&self, Parameters(params): Parameters<ListAreasParams>) -> String {
+        let map_data = self.state.map_data.read().await;
+        let mut areas = map_data.index.all_areas();
         if let Some(prefix) = &params.prefix {
             areas.retain(|a| a.starts_with(prefix.as_str()));
         }
@@ -177,7 +185,7 @@ impl StaticTools {
 
         let mut result = format!("{} areas found:\n", areas.len());
         for area in areas {
-            let tile_count = self.state.index.area_tiles(area).len();
+            let tile_count = map_data.index.area_tiles(area).len();
             result.push_str(&format!("  {} ({} tiles)\n", area, tile_count));
         }
         result
@@ -185,8 +193,9 @@ impl StaticTools {
 
     /// Get all objects within an area.
     #[tool(description = "Get all objects in a specific area, grouped by type")]
-    fn query_area(&self, Parameters(params): Parameters<QueryAreaParams>) -> String {
-        let objects = self.state.index.objects_in_area(&params.area_path);
+    async fn query_area(&self, Parameters(params): Parameters<QueryAreaParams>) -> String {
+        let map_data = self.state.map_data.read().await;
+        let objects = map_data.index.objects_in_area(&params.area_path);
 
         if objects.is_empty() {
             return format!("No objects in area '{}' (area may not exist)", params.area_path);
@@ -198,7 +207,7 @@ impl StaticTools {
             *type_counts.entry(&obj.prefab.path).or_default() += 1;
         }
 
-        let tiles = self.state.index.area_tiles(&params.area_path);
+        let tiles = map_data.index.area_tiles(&params.area_path);
         let mut result = format!(
             "Area '{}': {} tiles, {} objects\n\nObject types:\n",
             params.area_path,
@@ -213,9 +222,10 @@ impl StaticTools {
 
     /// Find all instances of a type (including subtypes) on the map.
     #[tool(description = "Find all instances of a type path on the map (matches subtypes). Returns positions and variable overrides.")]
-    fn query_object_type(&self, Parameters(params): Parameters<QueryTypeParams>) -> String {
+    async fn query_object_type(&self, Parameters(params): Parameters<QueryTypeParams>) -> String {
         let limit = params.limit.unwrap_or(50);
-        let instances = self.state.index.instances_of(&params.type_path);
+        let map_data = self.state.map_data.read().await;
+        let instances = map_data.index.instances_of(&params.type_path);
 
         if instances.is_empty() {
             return format!("No instances of '{}' on the map", params.type_path);
@@ -237,8 +247,9 @@ impl StaticTools {
 
     /// Get objects on tiles adjacent to a position (4-directional).
     #[tool(description = "Get all objects on tiles adjacent (N/S/E/W) to a position")]
-    fn query_adjacent(&self, Parameters(params): Parameters<QueryAdjacentParams>) -> String {
+    async fn query_adjacent(&self, Parameters(params): Parameters<QueryAdjacentParams>) -> String {
         let z = params.z.unwrap_or(1);
+        let map_data = self.state.map_data.read().await;
 
         let dirs: [(i32, i32, &str); 4] = [
             (0, 1, "North"),
@@ -251,7 +262,7 @@ impl StaticTools {
         for (dx, dy, dir_name) in &dirs {
             let nx = params.x + dx;
             let ny = params.y + dy;
-            let tile_objects = self.state.index.at(nx, ny, z);
+            let tile_objects = map_data.index.at(nx, ny, z);
             if !tile_objects.is_empty() {
                 result.push_str(&format!("  {} ({},{}):\n", dir_name, nx, ny));
                 for obj in tile_objects {
@@ -264,10 +275,11 @@ impl StaticTools {
 
     /// Get all objects within a radius of a position.
     #[tool(description = "Get all objects within a tile radius of a position")]
-    fn query_nearby(&self, Parameters(params): Parameters<QueryNearbyParams>) -> String {
+    async fn query_nearby(&self, Parameters(params): Parameters<QueryNearbyParams>) -> String {
         let z = params.z.unwrap_or(1);
         let radius = params.radius.unwrap_or(3);
-        let nearby = self.state.index.nearby(params.x, params.y, z, radius);
+        let map_data = self.state.map_data.read().await;
+        let nearby = map_data.index.nearby(params.x, params.y, z, radius);
 
         let mut result = format!(
             "{} objects within {} tiles of ({}, {}, {}):\n",
@@ -287,9 +299,10 @@ impl StaticTools {
 
     /// Trace a cable or pipe network from a starting position using BFS.
     #[tool(description = "Trace a connected network (cables, pipes, etc.) from a starting tile via BFS. Returns all connected positions.")]
-    fn trace_network(&self, Parameters(params): Parameters<TraceNetworkParams>) -> String {
+    async fn trace_network(&self, Parameters(params): Parameters<TraceNetworkParams>) -> String {
         let z = params.z.unwrap_or(1);
-        let network = self.state.index.trace_network(params.x, params.y, z, &params.network_type);
+        let map_data = self.state.map_data.read().await;
+        let network = map_data.index.trace_network(params.x, params.y, z, &params.network_type);
 
         if network.is_empty() {
             return format!(
@@ -306,7 +319,7 @@ impl StaticTools {
         // Show which areas the network spans
         let mut area_counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
         for &(nx, ny, nz) in &network {
-            if let Some(area) = self.state.index.area_of(nx, ny, nz) {
+            if let Some(area) = map_data.index.area_of(nx, ny, nz) {
                 *area_counts.entry(area).or_default() += 1;
             }
         }
@@ -319,17 +332,18 @@ impl StaticTools {
 
     /// Search object type paths on the map by substring.
     #[tool(description = "Search for object types on the map by substring match against type paths")]
-    fn search_objects(&self, Parameters(params): Parameters<SearchObjectsParams>) -> String {
+    async fn search_objects(&self, Parameters(params): Parameters<SearchObjectsParams>) -> String {
         let limit = params.limit.unwrap_or(20);
         let query_lower = params.query.to_lowercase();
+        let map_data = self.state.map_data.read().await;
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        let (dx, dy, dz) = (self.state.index.dim_x, self.state.index.dim_y, self.state.index.dim_z);
+        let (dx, dy, dz) = (map_data.index.dim_x, map_data.index.dim_y, map_data.index.dim_z);
         for z in 1..=(dz as i32) {
             for y in 1..=(dy as i32) {
                 for x in 1..=(dx as i32) {
-                    for prefab in self.state.index.at(x, y, z) {
+                    for prefab in map_data.index.at(x, y, z) {
                         if prefab.path.to_lowercase().contains(&query_lower) {
                             seen.insert(prefab.path.clone());
                         }
@@ -346,7 +360,7 @@ impl StaticTools {
                 result.push_str(&format!("  ... and {} more\n", sorted.len() - limit));
                 break;
             }
-            let count = self.state.index.instances_of(path).len();
+            let count = map_data.index.instances_of(path).len();
             result.push_str(&format!("  {} (×{})\n", path, count));
         }
         result
@@ -354,13 +368,14 @@ impl StaticTools {
 
     /// Run all JS validation rules against the loaded map.
     #[tool(description = "Run JavaScript validation rules against the loaded map. Returns violations grouped by severity.")]
-    fn validate_rules(&self, Parameters(params): Parameters<ValidateRulesParams>) -> String {
+    async fn validate_rules(&self, Parameters(params): Parameters<ValidateRulesParams>) -> String {
         let engine = match &self.state.rule_engine {
             Some(e) => e,
             None => return "No rules directory configured. Use --rules <dir> to specify a rules directory.".into(),
         };
 
-        let result = match engine.evaluate(&self.state.index) {
+        let map_data = self.state.map_data.read().await;
+        let result = match engine.evaluate(&map_data.index) {
             Ok(r) => r,
             Err(e) => return format!("Rule evaluation failed: {}", e),
         };
@@ -550,6 +565,31 @@ impl StaticTools {
             Err(e) => format!("Render failed: {}", e),
         }
     }
+
+    /// Save the map to a file (overwrite or new path).
+    #[tool(description = "Save the current map state to a .dmm file. Without a path, overwrites the loaded file. Returns the number of dictionary entries.")]
+    async fn save_map(&self, Parameters(params): Parameters<SaveMapParams>) -> String {
+        let save_path = params.path
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.state.dmm_path.clone());
+
+        let mut map_data = self.state.map_data.write().await;
+        
+        if !map_data.dirty {
+            return format!("Map has no unsaved changes. Save path would be: {}", save_path.display());
+        }
+
+        match map_data.save(&save_path) {
+            Ok(()) => {
+                let dict_size = map_data.map.dictionary.len();
+                format!(
+                    "✅ Map saved to: {}\n  {} dictionary entries\n  Map marked clean.",
+                    save_path.display(), dict_size
+                )
+            }
+            Err(e) => format!("❌ Save failed: {}", e),
+        }
+    }
 }
 
 // ── Dynamic MCP Server Handler ───────────────────────────────────────
@@ -589,17 +629,21 @@ impl ServerHandler for MapTools {
         ServerInfo {
             instructions: Some(
                 "SS13 Map Intelligence — query tiles, areas, objects, networks, validate maps, \
-                 and assemble prefabs with the builder pattern.\n\n\
+                 render regions, and assemble + place prefabs with the builder pattern.\n\n\
                  ## Builder Pattern\n\
                  Use `builder_init(type_path)` to start assembling a prefab. This REPLACES the \
                  tool surface with builder-specific tools:\n\
                  - `list_vars` — enumerate available properties with types/defaults\n\
                  - `var_info(name)` — detailed info on a specific var\n\
-                 - `set_var(name, value)` — set with validation\n\
+                 - `set_var(name, value)` — set with validation. Supports strings, numbers, \
+                   paths (/obj/...), lists ([1,2,3]), assoc maps ({\"key\": val}), resources ('icon.dmi')\n\
                  - `edit(var_name)` — push a sub-scope for a datum property (replaces tools again)\n\
                  - `validate()` — check readiness\n\
-                 - `commit()` — pop scope, fold into parent. Returns to parent scope's tools.\n\
+                 - `commit()` — pop scope. Root scope can place on tile with x,y,z args.\n\
                  - `discard()` — pop scope without saving\n\n\
+                 ## Map Mutation\n\
+                 When committing a root scope, provide x,y,z to place the prefab on a tile.\n\
+                 Use `save_map()` to write changes to disk. Changes are tracked (dirty flag).\n\n\
                  The tool list changes on every scope transition. Only one scope is visible at a time."
                 .into()
             ),
@@ -615,7 +659,8 @@ impl ServerHandler for MapTools {
         async move {
             let stack = self.scope_stack.read().await;
             let tools = if let Some(scope) = stack.current() {
-                scope.tools()
+                let is_root = stack.is_root();
+                scope.tools(is_root)
             } else {
                 // Static tools + builder_init entry point
                 let mut tools = self.static_tools.tool_router.list_all();
@@ -692,7 +737,7 @@ impl MapTools {
     }
 
     /// Dispatch a tool call to the builder system.
-    /// Handles scope transitions and fires notifications.
+    /// Handles scope transitions, placement mutations, and fires notifications.
     async fn dispatch_builder_tool(
         &self,
         tool_name: &str,
@@ -709,6 +754,13 @@ impl MapTools {
 
         match result {
             Ok(response) => {
+                // Check for placement request (root commit with coordinates)
+                let final_text = if response.text.starts_with("PLACEMENT_PENDING:") {
+                    self.handle_placement(&response.text).await
+                } else {
+                    response.text
+                };
+
                 // If the tool call changed the scope, notify the client
                 if response.scope_changed {
                     if let Err(e) = peer.notify_tool_list_changed().await {
@@ -716,7 +768,7 @@ impl MapTools {
                     }
                 }
                 Ok(CallToolResult::success(vec![
-                    rmcp::model::Content::text(response.text),
+                    rmcp::model::Content::text(final_text),
                 ]))
             }
             Err(msg) => {
@@ -725,5 +777,156 @@ impl MapTools {
                 ]))
             }
         }
+    }
+
+    /// Handle a placement request from root commit.
+    /// Parses the PLACEMENT_PENDING header and mutates the map.
+    async fn handle_placement(&self, text: &str) -> String {
+        // Parse "PLACEMENT_PENDING:x:y:z:replace_path:prefab_str\n..."
+        let first_line = text.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.splitn(6, ':').collect();
+        
+        if parts.len() < 5 {
+            return format!("Internal error: malformed placement header\n{}", text);
+        }
+
+        let x: i32 = parts[1].parse().unwrap_or(0);
+        let y: i32 = parts[2].parse().unwrap_or(0);
+        let z: i32 = parts[3].parse().unwrap_or(1);
+        let replace_path = if parts[4].is_empty() { None } else { Some(parts[4]) };
+
+        // Reconstruct the prefab from the builder's last scope
+        // We need to rebuild it since we can't pass complex objects through text
+        // The args were already consumed, so we parse the prefab line
+        let prefab_line = text.lines()
+            .find(|l| l.starts_with("Prefab: "))
+            .map(|l| &l[8..])
+            .unwrap_or("");
+
+        // Build the prefab from the text representation
+        // For proper placement, rebuild from the type path and vars
+        let prefab = parse_prefab_display(prefab_line);
+
+        let mut map_data = self.state.map_data.write().await;
+        
+        // Validate coordinates are in bounds
+        let (dim_x, dim_y, dim_z) = (map_data.index.dim_x, map_data.index.dim_y, map_data.index.dim_z);
+        if x < 1 || x > dim_x as i32 || y < 1 || y > dim_y as i32 || z < 1 || z > dim_z as i32 {
+            return format!(
+                "Coordinates ({},{},{}) out of bounds. Map dimensions: {}x{}x{}\n{}",
+                x, y, z, dim_x, dim_y, dim_z,
+                &text[text.find('\n').unwrap_or(0)..],
+            );
+        }
+
+        // Remove replacement if specified
+        if let Some(rp) = replace_path {
+            match map_data.remove_prefab(x, y, z, rp) {
+                Ok(true) => {},
+                Ok(false) => {
+                    tracing::warn!("Replace target '{}' not found at ({},{},{})", rp, x, y, z);
+                }
+                Err(e) => {
+                    return format!("Failed to remove '{}': {}", rp, e);
+                }
+            }
+        }
+
+        // Place the new prefab
+        match map_data.place_prefab(x, y, z, prefab) {
+            Ok(()) => {
+                format!(
+                    "✅ Prefab placed at ({}, {}, {})\n  {}\n{}\n\
+                     Map has unsaved changes. Use `save_map()` to write to disk.\n\
+                     Tool surface restored to base map tools.",
+                    x, y, z, prefab_line,
+                    replace_path.map(|rp| format!("  Replaced: {}\n", rp)).unwrap_or_default(),
+                )
+            }
+            Err(e) => format!("❌ Placement failed: {}\n  {}", e, prefab_line),
+        }
+    }
+}
+
+/// Parse a Prefab from its Display format: "/path/to/type{var = val; var2 = val2}"
+/// This is a best-effort parser for round-tripping through the text protocol.
+fn parse_prefab_display(s: &str) -> dmm_tools::dmm::Prefab {
+    let s = s.trim();
+    
+    // Split into path and vars
+    if let Some(brace_start) = s.find('{') {
+        let path = s[..brace_start].trim().to_string();
+        let vars_str = &s[brace_start+1..s.len()-1]; // strip { and }
+        
+        let mut prefab = dmm_tools::dmm::Prefab::from_path(path);
+        
+        // Parse semicolon-separated var = value pairs
+        for pair in vars_str.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() { continue; }
+            
+            if let Some(eq_pos) = pair.find('=') {
+                let name = pair[..eq_pos].trim();
+                let value_str = pair[eq_pos+1..].trim();
+                
+                // Parse the value back into a Constant
+                let constant = parse_dm_value(value_str);
+                prefab.vars.insert(name.to_string(), constant);
+            }
+        }
+        
+        prefab
+    } else {
+        dmm_tools::dmm::Prefab::from_path(s.to_string())
+    }
+}
+
+/// Parse a DM value string back into a Constant.
+/// Handles: numbers, strings ("..."), null, paths (/foo/bar), resources ('foo.dmi'), lists.
+fn parse_dm_value(s: &str) -> dreammaker::constants::Constant {
+    use dreammaker::ast::Ident;
+    use dreammaker::constants::Constant;
+    
+    let s = s.trim();
+    
+    if s == "null" {
+        Constant::Null(None)
+    } else if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        // String literal — unescape basic escapes
+        let inner = &s[1..s.len()-1];
+        let unescaped = inner.replace("\\\"", "\"").replace("\\n", "\n").replace("\\\\", "\\");
+        Constant::String(Ident::from_nonstatic(&unescaped))
+    } else if s.starts_with('\'') && s.ends_with('\'') && s.len() >= 2 {
+        // Resource literal
+        Constant::Resource(Ident::from_nonstatic(&s[1..s.len()-1]))
+    } else if s.starts_with('/') {
+        // Type path / prefab
+        Constant::Prefab(Box::new(dreammaker::constants::Pop::from_path_str(s)))
+    } else if s.starts_with("list(") && s.ends_with(')') {
+        // List literal — simplified parser
+        let inner = &s[5..s.len()-1];
+        let items: Vec<(Constant, Option<Constant>)> = if inner.is_empty() {
+            Vec::new()
+        } else {
+            // Simple split by comma (doesn't handle nested lists)
+            inner.split(',')
+                .map(|item| {
+                    let item = item.trim();
+                    if let Some(eq) = item.find('=') {
+                        let key = parse_dm_value(item[..eq].trim());
+                        let val = parse_dm_value(item[eq+1..].trim());
+                        (key, Some(val))
+                    } else {
+                        (parse_dm_value(item), None)
+                    }
+                })
+                .collect()
+        };
+        Constant::List(items.into_boxed_slice())
+    } else if let Ok(f) = s.parse::<f32>() {
+        Constant::Float(f)
+    } else {
+        // Unknown — treat as string
+        Constant::String(Ident::from_nonstatic(s))
     }
 }

@@ -7,7 +7,7 @@
 //! - `set_var(name, value)` — set a property (validated against objtree)
 //! - `edit(var_name)` — push sub-scope for a datum property
 //! - `validate()` — check readiness
-//! - `commit()` — pop scope, fold into parent
+//! - `commit()` — pop scope, fold into parent (root: optionally place on tile)
 //! - `discard()` — pop scope without saving
 //!
 //! The tool surface is REPLACED on every scope transition.
@@ -54,7 +54,7 @@ pub struct BuilderScope {
 
 impl BuilderScope {
     /// Generate the MCP tool definitions for this scope.
-    pub fn tools(&self) -> Vec<rmcp::model::Tool> {
+    pub fn tools(&self, is_root: bool) -> Vec<rmcp::model::Tool> {
         use rmcp::model::Tool;
 
         let mut tools = Vec::new();
@@ -100,7 +100,9 @@ impl BuilderScope {
         tools.push(Tool::new(
             "set_var",
             format!(
-                "Set a variable on the {} being built. Validates against the objtree.",
+                "Set a variable on the {} being built. Validates against the objtree. \
+                 Values: strings, numbers, null, paths (/obj/...), lists ([1,2,3]), \
+                 assoc maps ({{\"key\": val}}), resource literals ('icons/foo.dmi').",
                 self.type_path
             ),
             schema(json!({
@@ -111,7 +113,7 @@ impl BuilderScope {
                         "description": "Variable name to set"
                     },
                     "value": {
-                        "description": "Value to set (string, number, null, or path)"
+                        "description": "Value to set (string, number, null, array for list(), object for assoc list, or path string starting with /)"
                     }
                 },
                 "required": ["name", "value"]
@@ -151,15 +153,44 @@ impl BuilderScope {
             })),
         ));
 
-        // commit — pop scope
-        tools.push(Tool::new(
-            "commit",
-            "Finalize this scope and return to the parent. If root scope, produces the final prefab.",
-            schema(json!({
-                "type": "object",
-                "properties": {}
-            })),
-        ));
+        // commit — pop scope (root commit can place on tile)
+        if is_root {
+            tools.push(Tool::new(
+                "commit",
+                "Finalize the prefab. Optionally place it on a tile by providing x, y, z coordinates. \
+                 Without coordinates, just produces the prefab string.",
+                schema(json!({
+                    "type": "object",
+                    "properties": {
+                        "x": {
+                            "type": "integer",
+                            "description": "X coordinate to place the prefab (1-based)"
+                        },
+                        "y": {
+                            "type": "integer",
+                            "description": "Y coordinate to place the prefab (1-based)"
+                        },
+                        "z": {
+                            "type": "integer",
+                            "description": "Z level to place the prefab (default 1)"
+                        },
+                        "replace": {
+                            "type": "string",
+                            "description": "Type path to replace on the tile (removes first match before placing)"
+                        }
+                    }
+                })),
+            ));
+        } else {
+            tools.push(Tool::new(
+                "commit",
+                "Finalize this sub-scope and fold changes into the parent scope.",
+                schema(json!({
+                    "type": "object",
+                    "properties": {}
+                })),
+            ));
+        }
 
         // discard — pop scope without saving
         tools.push(Tool::new(
@@ -224,6 +255,11 @@ impl BuilderScopeStack {
     pub fn depth(&self) -> usize {
         self.stack.len()
     }
+
+    /// Check if the current scope is the root (depth 1).
+    pub fn is_root(&self) -> bool {
+        self.stack.len() == 1
+    }
 }
 
 // ── Tool dispatch ────────────────────────────────────────────────────
@@ -286,7 +322,7 @@ fn handle_init(
              {} settable variables available.\n\n\
              Tool surface has been REPLACED with builder tools.\n\
              Use `list_vars` to see available properties, `set_var` to set them.\n\
-             Use `commit()` when done, `discard()` to cancel.",
+             Use `commit()` when done (optionally with x,y,z to place on tile), `discard()` to cancel.",
             type_path, var_count
         ),
         scope_changed: true,
@@ -314,7 +350,7 @@ fn handle_list_vars(
     // Walk the type hierarchy to collect all vars
     let vars = collect_vars(&state.objtree, type_ref);
 
-    for (name, default, declared_on) in &vars {
+    for (name, default, type_info, declared_on) in &vars {
         // Apply filter
         if let Some(f) = filter {
             if !name.to_lowercase().contains(&f.to_lowercase()) {
@@ -328,12 +364,17 @@ fn handle_list_vars(
             Some(c) => format_constant(c),
             None => "null".to_string(),
         };
+        let type_str = if !type_info.is_empty() {
+            format!(" : {}", type_info)
+        } else {
+            String::new()
+        };
         let inherited = if *declared_on != scope.type_path {
             format!(" (from {})", short_name(declared_on))
         } else {
             String::new()
         };
-        output.push_str(&format!("  {}{} = {}{}\n", name, set_indicator, default_str, inherited));
+        output.push_str(&format!("  {}{}{} = {}{}\n", name, type_str, set_indicator, default_str, inherited));
     }
 
     output.push_str(&format!("\n{} variables{}", count, 
@@ -401,9 +442,12 @@ fn handle_var_info(
 
     output.push_str(&format!("Type: {}\n", type_info));
 
-    // Check if this is a datum-typed var (can use edit())
+    // Type-specific guidance
     if type_info.starts_with('/') {
         output.push_str("\nThis is a datum-typed variable. Use `edit(var_name)` to configure it as a sub-assembly.\n");
+    } else if type_info.contains("list") || matches!(constant, Some(Constant::List(_))) {
+        output.push_str("\nThis is a list variable. Set with a JSON array: set_var(name, [val1, val2, ...])\n");
+        output.push_str("For associative lists: set_var(name, {\"key\": value, ...})\n");
     }
 
     Ok(BuilderResponse {
@@ -451,14 +495,24 @@ fn handle_set_var(
         .map(|c| format_constant(c))
         .unwrap_or_else(|| "null".to_string());
 
+    // Validate the value can be converted to a DM constant
+    let dm_value = crate::state::json_to_constant(&value);
+    let dm_value_str = format!("{}", dm_value);
+
     let old_value = scope.vars.get(&var_name).cloned();
     scope.vars.insert(var_name.clone(), value.clone());
 
-    let mut output = format!("Set {}.{} = {}\n", short_name(&scope.type_path), var_name, value);
+    let mut output = format!("Set {}.{} = {}\n", short_name(&scope.type_path), var_name, dm_value_str);
     if let Some(old) = old_value {
         output.push_str(&format!("Previous: {}\n", old));
     }
     output.push_str(&format!("Default: {}\n", default_str));
+
+    // Note if it matches default (will be omitted from prefab)
+    if dm_value_str == default_str {
+        output.push_str("⚠ Value matches default — will be omitted from prefab string.\n");
+    }
+
     output.push_str(&format!("\n{} variables set in this scope.", scope.vars.len()));
 
     Ok(BuilderResponse {
@@ -485,6 +539,18 @@ fn handle_edit(
     let (parent_type_path, parent_breadcrumb) = {
         let scope = stack.current()
             .ok_or("No active builder scope")?;
+        
+        // Verify the var exists
+        let type_ref = find_type(&state.objtree, &scope.type_path)
+            .ok_or_else(|| format!("Type '{}' not found", scope.type_path))?;
+        
+        if !type_hierarchy_has_var(type_ref, &var_name) {
+            return Err(format!(
+                "Variable '{}' is not declared on {} or any parent type.",
+                var_name, scope.type_path
+            ));
+        }
+
         (scope.type_path.clone(), scope.breadcrumb.clone())
     };
 
@@ -573,33 +639,31 @@ fn handle_validate(
     } else {
         output.push_str("Set variables:\n");
         for (name, value) in &scope.vars {
+            let dm_val = crate::state::json_to_constant(value);
+            let dm_str = format!("{}", dm_val);
+            
             let var_val = type_ref.get_value(name);
             let default_str = var_val
                 .and_then(|v| v.constant.as_ref())
                 .map(|c| format_constant(c))
                 .unwrap_or_else(|| "null".to_string());
-            let is_different = format!("{}", value) != default_str;
-            output.push_str(&format!("  {} = {} {}\n", name, value,
+            let is_different = dm_str != default_str;
+            output.push_str(&format!("  {} = {} {}\n", name, dm_str,
                 if is_different { "(overrides default)" } else { "(same as default — will be omitted)" }
             ));
         }
     }
 
-    // Show what the final prefab would look like (non-default overrides only)
-    let overrides = compute_overrides(&state.objtree, type_ref, &scope.vars);
+    // Build the actual prefab to show preview
+    let prefab = crate::state::build_prefab(&scope.type_path, &scope.vars, &state.objtree);
 
-    output.push_str(&format!("\nPrefab preview: {}", scope.type_path));
-    if !overrides.is_empty() {
-        output.push('{');
-        for (i, (name, value)) in overrides.iter().enumerate() {
-            if i > 0 { output.push_str("; "); }
-            output.push_str(&format!("{} = {}", name, value));
-        }
-        output.push('}');
+    output.push_str(&format!("\nPrefab preview: {}\n", prefab));
+
+    if stack.is_root() {
+        output.push_str("\nReady to commit. Use `commit()` to finalize, or `commit(x, y, z)` to place on a tile.");
+    } else {
+        output.push_str("\nReady to commit. Use `commit()` to fold into parent scope.");
     }
-    output.push('\n');
-
-    output.push_str("\nReady to commit. Use `commit()` to finalize or continue editing.");
 
     Ok(BuilderResponse {
         text: output,
@@ -612,7 +676,7 @@ fn handle_validate(
 fn handle_commit(
     state: &Arc<ServerState>,
     stack: &mut BuilderScopeStack,
-    _args: JsonMap<String, JsonValue>,
+    args: JsonMap<String, JsonValue>,
 ) -> Result<BuilderResponse, String> {
     let scope = stack.pop()
         .ok_or("No active builder scope to commit")?;
@@ -620,30 +684,54 @@ fn handle_commit(
     let is_root = !stack.is_active();
 
     if is_root {
-        // Root commit — produce the final prefab string
-        let type_ref = find_type(&state.objtree, &scope.type_path)
-            .ok_or_else(|| format!("Type '{}' not found", scope.type_path))?;
+        // Root commit — produce the final prefab
+        let prefab = crate::state::build_prefab(&scope.type_path, &scope.vars, &state.objtree);
+        let prefab_str = format!("{}", prefab);
 
-        let overrides = compute_overrides(&state.objtree, type_ref, &scope.vars);
+        // Check if placement coordinates were provided
+        let has_placement = args.contains_key("x") || args.contains_key("y");
+        
+        if has_placement {
+            let x = args.get("x")
+                .and_then(|v| v.as_i64())
+                .ok_or("Placement requires x coordinate (integer)")? as i32;
+            let y = args.get("y")
+                .and_then(|v| v.as_i64())
+                .ok_or("Placement requires y coordinate (integer)")? as i32;
+            let z = args.get("z")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1) as i32;
+            let replace = args.get("replace")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
-        let mut prefab = scope.type_path.clone();
-        if !overrides.is_empty() {
-            prefab.push('{');
-            for (i, (name, value)) in overrides.iter().enumerate() {
-                if i > 0 { prefab.push_str("; "); }
-                prefab.push_str(&format!("{} = {}", name, value));
-            }
-            prefab.push('}');
+            // Store placement info in a thread-local or return it as part of the response
+            // The actual mutation happens in dispatch_builder_tool which has async access
+            Ok(BuilderResponse {
+                text: format!(
+                    "PLACEMENT_PENDING:{}:{}:{}:{}:{}\n\
+                     Prefab: {}\n\
+                     Target: ({}, {}, {}){}\n\
+                     Tool surface restored to base map tools.",
+                    x, y, z,
+                    replace.as_deref().unwrap_or(""),
+                    prefab_str,
+                    prefab_str,
+                    x, y, z,
+                    replace.as_ref().map(|r| format!(" (replacing {})", r)).unwrap_or_default(),
+                ),
+                scope_changed: true,
+            })
+        } else {
+            Ok(BuilderResponse {
+                text: format!(
+                    "Prefab committed:\n  {}\n\n\
+                     Tool surface restored to base map tools.",
+                    prefab_str
+                ),
+                scope_changed: true,
+            })
         }
-
-        Ok(BuilderResponse {
-            text: format!(
-                "Prefab committed:\n  {}\n\n\
-                 Tool surface restored to base map tools.",
-                prefab
-            ),
-            scope_changed: true,
-        })
     } else {
         // Sub-scope commit — fold vars into parent as a JSON object
         let parent_var = scope.parent_var.clone()
@@ -718,14 +806,17 @@ fn handle_where_am_i(
 
     let mut output = format!("Current scope: {}\n", scope.breadcrumb);
     output.push_str(&format!("Type: {}\n", scope.type_path));
-    output.push_str(&format!("Depth: {}\n", stack.depth()));
+    output.push_str(&format!("Depth: {} ({})\n", stack.depth(),
+        if stack.is_root() { "root" } else { "sub-scope" }
+    ));
 
     if scope.vars.is_empty() {
         output.push_str("No variables set yet.\n");
     } else {
         output.push_str(&format!("{} variables set:\n", scope.vars.len()));
         for (name, value) in &scope.vars {
-            output.push_str(&format!("  {} = {}\n", name, value));
+            let dm_val = crate::state::json_to_constant(value);
+            output.push_str(&format!("  {} = {}\n", name, dm_val));
         }
     }
 
@@ -738,7 +829,7 @@ fn handle_where_am_i(
 // ── Objtree helpers ──────────────────────────────────────────────────
 
 /// Find a type in the objtree by its full path.
-fn find_type<'a>(objtree: &'a ObjectTree, path: &str) -> Option<TypeRef<'a>> {
+pub fn find_type<'a>(objtree: &'a ObjectTree, path: &str) -> Option<TypeRef<'a>> {
     // Navigate the type path through the tree
     let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
     let mut current = objtree.root();
@@ -772,11 +863,11 @@ fn type_hierarchy_has_var(type_ref: TypeRef<'_>, var_name: &str) -> bool {
 }
 
 /// Collect all settable vars for a type, walking the inheritance chain.
-/// Returns (name, default_constant, declared_on_path).
+/// Returns (name, default_constant, type_info, declared_on_path).
 fn collect_vars<'a>(
     _objtree: &'a ObjectTree,
     type_ref: TypeRef<'a>,
-) -> Vec<(String, Option<&'a Constant>, String)> {
+) -> Vec<(String, Option<&'a Constant>, String, String)> {
     let mut vars = BTreeMap::new();
 
     // Walk from the type up to root, collecting vars
@@ -797,7 +888,20 @@ fn collect_vars<'a>(
                 continue;
             }
             let default = var.value.constant.as_ref();
-            vars.insert(name_str.to_string(), (name_str.to_string(), default, path.clone()));
+            
+            // Get type info from declaration
+            let type_info = if let Some(decl) = var.declaration.as_ref() {
+                let tp = &decl.var_type.type_path;
+                if !tp.is_empty() {
+                    format!("/{}", tp.iter().map(|i| i.as_str()).collect::<Vec<_>>().join("/"))
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
+            vars.insert(name_str.to_string(), (name_str.to_string(), default, type_info, path.clone()));
         }
     }
 
@@ -829,6 +933,8 @@ fn infer_type_from_constant(constant: Option<&Constant>) -> String {
                 .join("/");
             format!("prefab (default: /{})", path)
         }
+        Some(Constant::List(_)) => "list".to_string(),
+        Some(Constant::New { .. }) => "new datum".to_string(),
         None => "unknown".to_string(),
         _ => "complex".to_string(),
     }
@@ -853,67 +959,19 @@ fn format_constant(c: &Constant) -> String {
                 .join("/");
             format!("/{}", path)
         }
-        _ => format!("{:?}", c),
-    }
-}
-
-/// Compute which vars differ from defaults (for the final DMM prefab string).
-fn compute_overrides(
-    _objtree: &ObjectTree,
-    type_ref: TypeRef<'_>,
-    vars: &BTreeMap<String, JsonValue>,
-) -> Vec<(String, String)> {
-    let mut overrides = Vec::new();
-
-    for (name, value) in vars {
-        let var_val = type_ref.get_value(name);
-        let default_str = var_val
-            .and_then(|v| v.constant.as_ref())
-            .map(|c| format_constant(c))
-            .unwrap_or_else(|| "null".to_string());
-
-        // Format the value for DMM
-        let value_str = json_to_dm_value(value);
-
-        // Only include if different from default
-        if value_str != default_str {
-            overrides.push((name.clone(), value_str));
-        }
-    }
-
-    overrides
-}
-
-/// Convert a JSON value to a DM value string for the DMM prefab format.
-fn json_to_dm_value(value: &JsonValue) -> String {
-    match value {
-        JsonValue::String(s) => format!("{:?}", s),
-        JsonValue::Number(n) => format!("{}", n),
-        JsonValue::Bool(b) => if *b { "1".to_string() } else { "0".to_string() },
-        JsonValue::Null => "null".to_string(),
-        JsonValue::Object(obj) => {
-            // Sub-datum: extract the type path and vars
-            if let Some(tp) = obj.get("_type").and_then(|v| v.as_str()) {
-                let mut s = tp.to_string();
-                if let Some(vars) = obj.get("_vars").and_then(|v| v.as_object()) {
-                    if !vars.is_empty() {
-                        s.push('{');
-                        for (i, (k, v)) in vars.iter().enumerate() {
-                            if i > 0 { s.push_str("; "); }
-                            s.push_str(&format!("{} = {}", k, json_to_dm_value(v)));
-                        }
-                        s.push('}');
-                    }
+        Constant::List(args) => {
+            let mut s = String::from("list(");
+            for (i, (key, val)) in args.iter().enumerate() {
+                if i > 0 { s.push_str(", "); }
+                s.push_str(&format!("{}", key));
+                if let Some(v) = val {
+                    s.push_str(&format!(" = {}", v));
                 }
-                s
-            } else {
-                format!("{}", value)
             }
+            s.push(')');
+            s
         }
-        JsonValue::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(json_to_dm_value).collect();
-            format!("list({})", items.join(", "))
-        }
+        _ => format!("{}", c),
     }
 }
 

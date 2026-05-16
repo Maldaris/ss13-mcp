@@ -200,6 +200,84 @@ impl SpatialIndex {
         self.areas.keys().map(|s| s.as_str()).collect()
     }
 
+    // ── Mutation support ─────────────────────────────────────────────
+
+    /// Add an object to the spatial index at a given position.
+    pub fn add_object(&mut self, x: i32, y: i32, z: i32, prefab: Prefab) {
+        let pos = (x, y, z);
+
+        // Update grid
+        self.grid.entry(pos).or_default().push(prefab.clone());
+
+        // Update anchors
+        let located = LocatedPrefab { x, y, z, prefab: prefab.clone() };
+
+        self.anchors
+            .entry(prefab.path.clone())
+            .or_default()
+            .push(located.clone());
+
+        for (i, ch) in prefab.path.char_indices() {
+            if ch == '/' && i > 0 {
+                let prefix = &prefab.path[..i];
+                self.anchors
+                    .entry(prefix.to_string())
+                    .or_default()
+                    .push(located.clone());
+            }
+        }
+
+        // Update area index if it's an area
+        if prefab.path.starts_with("/area/") {
+            self.areas.entry(prefab.path.clone()).or_default().push(pos);
+            self.tile_area.insert(pos, prefab.path.clone());
+        }
+    }
+
+    /// Remove an object from the spatial index at a given position.
+    /// Removes the first prefab matching the exact path and vars.
+    pub fn remove_object(&mut self, x: i32, y: i32, z: i32, prefab: &Prefab) {
+        let pos = (x, y, z);
+
+        // Remove from grid
+        if let Some(list) = self.grid.get_mut(&pos) {
+            if let Some(idx) = list.iter().position(|p| p == prefab) {
+                list.remove(idx);
+            }
+        }
+
+        // Remove from anchors (exact path)
+        if let Some(list) = self.anchors.get_mut(&prefab.path) {
+            if let Some(idx) = list.iter().position(|lp| lp.x == x && lp.y == y && lp.z == z && lp.prefab == *prefab) {
+                list.remove(idx);
+            }
+        }
+
+        // Remove from prefix anchors
+        for (i, ch) in prefab.path.char_indices() {
+            if ch == '/' && i > 0 {
+                let prefix = &prefab.path[..i];
+                if let Some(list) = self.anchors.get_mut(prefix) {
+                    if let Some(idx) = list.iter().position(|lp| lp.x == x && lp.y == y && lp.z == z && lp.prefab == *prefab) {
+                        list.remove(idx);
+                    }
+                }
+            }
+        }
+
+        // Remove from area index
+        if prefab.path.starts_with("/area/") {
+            if let Some(list) = self.areas.get_mut(&prefab.path) {
+                if let Some(idx) = list.iter().position(|p| *p == pos) {
+                    list.remove(idx);
+                }
+            }
+            if self.tile_area.get(&pos).map(|a| a == &prefab.path).unwrap_or(false) {
+                self.tile_area.remove(&pos);
+            }
+        }
+    }
+
     /// Trace a cable/pipe network via BFS from a starting position.
     /// Returns all positions connected by objects matching `network_type`.
     pub fn trace_network(&self, start_x: i32, start_y: i32, start_z: i32, network_type: &str) -> Vec<(i32, i32, i32)> {

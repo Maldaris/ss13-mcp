@@ -16,6 +16,8 @@ use crate::state::ServerState;
 ///
 /// Coordinates are 1-based (matching BYOND's coordinate system).
 /// Returns the PNG as base64-encoded bytes.
+///
+/// NOTE: This acquires a blocking read lock on map_data. Call from sync context only.
 pub fn render_region(
     state: &ServerState,
     x1: usize,
@@ -25,7 +27,9 @@ pub fn render_region(
     z: usize,
     render_pass_filter: Option<&str>,
 ) -> Result<RenderResult> {
-    let (dim_x, dim_y, dim_z) = state.map.dim_xyz();
+    let map_data = state.map_data.blocking_read();
+
+    let (dim_x, dim_y, dim_z) = map_data.map.dim_xyz();
 
     // Validate bounds
     if z < 1 || z > dim_z {
@@ -52,11 +56,11 @@ pub fn render_region(
     let bump = bumpalo::Bump::new();
 
     // z_level uses 0-based index internally
-    let z_level = state.map.z_level(z - 1);
+    let z_level = map_data.map.z_level(z - 1);
 
     let ctx = minimap::Context {
         objtree: &state.objtree,
-        map: &state.map,
+        map: &map_data.map,
         level: z_level,
         // min/max are 0-based for the renderer
         min: (x1 - 1, y1 - 1),
@@ -96,32 +100,39 @@ pub fn render_area(
     area_path: &str,
     render_pass_filter: Option<&str>,
 ) -> Result<Option<RenderResult>> {
-    let tiles = state.index.area_tiles(area_path);
-    if tiles.is_empty() {
-        return Ok(None);
-    }
+    // Need to read index for bounding box, but render_region will also read.
+    // We can't hold the lock across both calls (deadlock), so read bounds first.
+    let bounds = {
+        let map_data = state.map_data.blocking_read();
+        let tiles = map_data.index.area_tiles(area_path);
+        if tiles.is_empty() {
+            return Ok(None);
+        }
 
-    // Find bounding box
-    let mut min_x = i32::MAX;
-    let mut min_y = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut max_y = i32::MIN;
-    let mut z = tiles[0].2;
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        let mut z = tiles[0].2;
 
-    for &(tx, ty, tz) in tiles {
-        min_x = min_x.min(tx);
-        min_y = min_y.min(ty);
-        max_x = max_x.max(tx);
-        max_y = max_y.max(ty);
-        z = tz; // Areas are typically single-z
-    }
+        for &(tx, ty, tz) in tiles {
+            min_x = min_x.min(tx);
+            min_y = min_y.min(ty);
+            max_x = max_x.max(tx);
+            max_y = max_y.max(ty);
+            z = tz;
+        }
 
-    // Add 1-tile padding for context
-    let pad = 1;
-    min_x = (min_x - pad).max(1);
-    min_y = (min_y - pad).max(1);
-    max_x = (max_x + pad).min(state.index.dim_x as i32);
-    max_y = (max_y + pad).min(state.index.dim_y as i32);
+        let pad = 1;
+        min_x = (min_x - pad).max(1);
+        min_y = (min_y - pad).max(1);
+        max_x = (max_x + pad).min(map_data.index.dim_x as i32);
+        max_y = (max_y + pad).min(map_data.index.dim_y as i32);
+
+        (min_x, min_y, max_x, max_y, z)
+    }; // map_data read lock dropped here
+
+    let (min_x, min_y, max_x, max_y, z) = bounds;
 
     let result = render_region(
         state,
