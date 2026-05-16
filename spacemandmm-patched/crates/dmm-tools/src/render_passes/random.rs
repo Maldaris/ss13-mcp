@@ -98,27 +98,11 @@ impl RenderPass for Random {
     ) {
         let mut rng = rand::rng();
 
-        const CONTRABAND_POSTERS: u32 = 44;
-        const LEGIT_POSTERS: u32 = 35;
-
-        if atom.istype("/obj/structure/sign/poster/contraband/random/") {
-            sprite.icon_state =
-                bumpalo::format!(in bump, "poster{}", rng.random_range(1..=CONTRABAND_POSTERS))
-                    .into_bump_str();
-        } else if atom.istype("/obj/structure/sign/poster/official/random/") {
-            sprite.icon_state =
-                bumpalo::format!(in bump, "poster{}_legit", rng.random_range(1..=LEGIT_POSTERS))
-                    .into_bump_str();
-        } else if atom.istype("/obj/structure/sign/poster/random/") {
-            let i = 1 + rng.random_range(0..CONTRABAND_POSTERS + LEGIT_POSTERS);
-            if i <= CONTRABAND_POSTERS {
-                sprite.icon_state = bumpalo::format!(in bump, "poster{}", i).into_bump_str();
-            } else {
-                sprite.icon_state =
-                    bumpalo::format!(in bump, "poster{}_legit", i - CONTRABAND_POSTERS)
-                        .into_bump_str();
-            }
-        } else if atom.istype("/obj/item/kirbyplants/random/")
+        // TG 2024+: poster random spawners now pick from subtypes with their own
+        // icon files. The old numeric poster system (poster1..poster44, poster1_legit..
+        // poster35_legit in poster.dmi) no longer exists. Random posters will render
+        // with their base sprite instead.
+        if atom.istype("/obj/item/kirbyplants/random/")
             || atom.istype("/obj/item/twohanded/required/kirbyplants/random/")
         {
             sprite.icon = "icons/obj/flora/plants.dmi";

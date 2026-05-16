@@ -381,8 +381,10 @@ impl RenderPass for Overlays {
                 icon_state: "grille",
                 ..atom.sprite
             });
-        } else if atom.istype("/obj/structure/closet/") {
-            // closet doors
+        } else if atom.istype("/obj/structure/closet/")
+            && !atom.istype("/obj/structure/closet/crate/")
+        {
+            // closet doors (crates don't use door overlays — fill is in base state)
             if atom.get_var("opened", objtree).to_bool() {
                 let var = if atom.get_var("icon_door_override", objtree).to_bool() {
                     "icon_door"
@@ -440,7 +442,21 @@ impl RenderPass for Overlays {
                     })
                 }
             } else {
-                add_to(overlays, atom, "fill_closed");
+                // TG 2024+: some airlock DMIs bake fill into the base sprite and
+                // lack a separate fill_closed state. Skip those types.
+                let skip_fill = atom.istype("/obj/machinery/door/airlock/hatch/")
+                    || atom.istype("/obj/machinery/door/airlock/maintenance_hatch/")
+                    || atom.istype("/obj/machinery/door/airlock/centcom/")
+                    || atom.istype("/obj/machinery/door/airlock/grunge/")
+                    || atom.istype("/obj/machinery/door/airlock/highsecurity/")
+                    || atom.istype("/obj/machinery/door/airlock/vault/")
+                    || atom.istype("/obj/machinery/door/airlock/freezer/")
+                    || atom.istype("/obj/machinery/door/airlock/abductor/")
+                    || atom.istype("/obj/machinery/door/airlock/tram/")
+                    || atom.istype("/obj/machinery/door/airlock/multi_tile/");
+                if !skip_fill {
+                    add_to(overlays, atom, "fill_closed");
+                }
             }
         } else if atom.istype("/obj/machinery/power/apc/") {
             // status overlays
@@ -492,9 +508,9 @@ impl RenderPass for Pretty {
                 });
             }
         } else if atom.istype("/obj/machinery/firealarm/") {
-            add_to(overlays, atom, "fire_overlay");
-            add_to(overlays, atom, "fire_0");
-            add_to(overlays, atom, "fire_off");
+            // TG 2024+: fire alarms use "fire0" base state with "fire_0".."fire_3"
+            // severity overlays at runtime. At rest (map render), no overlays needed.
+            // Old states "fire_overlay" and "fire_off" no longer exist.
         } else if atom.istype("/obj/structure/tank_dispenser/") {
             if let &Constant::Float(oxygen) = atom.get_var("oxygentanks", objtree) {
                 match oxygen as i32 {
