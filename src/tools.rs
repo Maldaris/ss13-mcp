@@ -117,7 +117,7 @@ pub struct RenderRegionParams {
     pub y2: usize,
     /// Z level (default 1)
     pub z: Option<usize>,
-    /// Render pass filter: "pipes", "cables", "pipes-and-cables", or comma-separated pass names. Default shows everything.
+    /// Render pass filter: "pipes", "cables", "pipes-and-cables", "areas" (show area overlays), "areas-only" (areas without details), or comma-separated pass names. Default shows everything.
     pub filter: Option<String>,
 }
 
@@ -125,8 +125,11 @@ pub struct RenderRegionParams {
 pub struct RenderAreaParams {
     /// Area type path (e.g. "/area/station/engineering/main")
     pub area_path: String,
-    /// Render pass filter: "pipes", "cables", "pipes-and-cables", or comma-separated pass names. Default shows everything.
+    /// Render pass filter: "pipes", "cables", "pipes-and-cables", "areas" (show area overlays), "areas-only" (areas without details), or comma-separated pass names. Default shows everything.
     pub filter: Option<String>,
+    /// Tiles of padding around the area's bounding box, so you can see how
+    /// adjacent areas mesh with the rendered area. Default 1.
+    pub padding: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -589,14 +592,15 @@ impl StaticTools {
     }
 
     /// Render an area of the map as a PNG image, auto-bounded to the area's extent.
-    #[tool(description = "Render all tiles of a specific area as a PNG image. Automatically finds the area's bounding box and adds 1-tile padding. Use filter for layer-specific views.")]
+    #[tool(description = "Render all tiles of a specific area as a PNG image. Automatically finds the area's bounding box. Use `padding` to include adjacent area context (default 1 tile, max 16). Use filter for layer-specific views.")]
     async fn render_area(&self, Parameters(params): Parameters<RenderAreaParams>) -> String {
         let state = self.state.clone();
         let area_path = params.area_path.clone();
         let filter_owned = params.filter.clone();
+        let padding = params.padding.map(|p| p.min(16));
 
         let result = tokio::task::spawn_blocking(move || {
-            crate::render::render_area(&state, &area_path, filter_owned.as_deref())
+            crate::render::render_area(&state, &area_path, filter_owned.as_deref(), padding)
         }).await;
 
         match result {

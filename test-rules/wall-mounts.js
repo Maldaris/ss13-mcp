@@ -8,6 +8,59 @@
 // Invalid: APC/directional/north on a wall tile
 // Invalid: APC/directional/north with no wall to the north
 
+// Wall-mounted objects "attach" to whatever is in the direction they face.
+// In the layout below, the light is mounted *on the door tile to its north*,
+// which is structurally invalid — the mount has nothing to fasten to.
+//
+//   . L .
+//   w D w     L = light (directional/north → faces north)
+//   . . .     D = door, w = wall
+//
+// Valid mount surfaces are walls (/turf/closed). Doors, windows, and open
+// space don't count. Some types legitimately mount on non-wall surfaces
+// (door buttons, window-doors); those are handled by wall-mount-no-wall-behind
+// which uses an explicit exempt list.
+rule("wall-mount-attached-to-door", {
+  anchor: "/obj/machinery",
+  severity: "error",
+  message: "Wall-mount at ({x},{y},{z}) is attached to a door — should face a wall instead",
+  check: function(obj, ctx) {
+    if (obj.path.indexOf("/directional/") === -1) return true;
+    if (ctx.isType(obj, "/obj/machinery/door")) return true;
+
+    // Some directional types legitimately face non-wall surfaces. Door
+    // buttons in particular mount on the wall *next to* the door they
+    // control, which often puts them facing the door itself.
+    var exempt = [
+      "/obj/machinery/button",
+      "/obj/machinery/door/window",
+    ];
+    for (var i = 0; i < exempt.length; i++) {
+      if (ctx.isType(obj, exempt[i])) return true;
+    }
+
+    // Compute the tile the mount faces
+    var dir = ctx.inferDir(obj);
+    var delta = ctx.dirToDelta(dir);
+    var fx = obj.x + delta.dx;
+    var fy = obj.y + delta.dy;
+    var fz = obj.z || 1;
+    var facing = ctx.at(fx, fy, fz);
+
+    // If facing tile contains a true door (airlock, firedoor), the mount
+    // is "on the door". Poddoors are shutters/blast doors that sit on
+    // reinforced windows — they're functionally a wall when closed, so
+    // mounting next to one is valid.
+    for (var i = 0; i < facing.length; i++) {
+      if (ctx.isType(facing[i], "/obj/machinery/door/poddoor")) continue;
+      if (ctx.isType(facing[i], "/obj/machinery/door")) {
+        return false;
+      }
+    }
+    return true;
+  }
+});
+
 // Wall-mounted objects must not be on a wall tile
 rule("wall-mount-on-wall-tile", {
   anchor: "/obj/machinery",

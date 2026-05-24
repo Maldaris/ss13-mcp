@@ -102,16 +102,16 @@ impl MapData {
         // Resolve current prefab list (override > dictionary)
         let mut new_prefabs = self.prefabs_at_raw(raw);
 
-        // If placing a turf or area, remove any existing one of the same layer
+        // If placing a turf or area, remove any existing one of the same layer.
+        // A tile has exactly one turf and one area; objs/mobs may stack freely.
         let new_layer = layer_priority(&prefab.path);
-        if new_layer <= 1 {
-            // Turf (1) or area (0) — remove existing of same layer
+        let path_kind = prefab.path.as_str();
+        if path_kind.starts_with("/turf") || path_kind.starts_with("/area") {
             let removed: Vec<Prefab> = new_prefabs.iter()
                 .filter(|p| layer_priority(&p.path) == new_layer)
                 .cloned()
                 .collect();
             new_prefabs.retain(|p| layer_priority(&p.path) != new_layer);
-            // Update spatial index for removed items
             for r in &removed {
                 self.index.remove_object(x, y, z, r);
             }
@@ -432,7 +432,12 @@ pub fn json_to_constant(value: &serde_json::Value) -> Constant {
 }
 
 /// Determine the insertion position in a prefab list based on layer ordering.
-/// BYOND layer order: area < turf < obj < mob
+/// Find the insertion index for a new prefab so the resulting list stays in
+/// BYOND DMM serialization order: objs/mobs first, then the turf, then the area
+/// last. The parser walks `members` from the end (`members[len-1]` is the area,
+/// `members[len-2]` is the turf), so getting this order wrong causes the area's
+/// vars (e.g. `turfs_by_zlevel`) to be applied to whatever is at the tail of
+/// the list, runtiming and leaving the trailing object partially-initialized.
 fn find_layer_position(prefabs: &[Prefab], path: &str) -> usize {
     let new_priority = layer_priority(path);
     for (i, p) in prefabs.iter().enumerate() {
@@ -444,13 +449,15 @@ fn find_layer_position(prefabs: &[Prefab], path: &str) -> usize {
     prefabs.len()
 }
 
-/// Get layer priority for insertion ordering.
-/// Lower number = earlier in the list (bottom of rendering stack).
+/// Layer priority for `.dmm` serialization order. Lower number = earlier in
+/// the tile's prefab list (closer to the front of the file's tuple). The
+/// resulting order is `(/obj..., /mob..., /turf, /area)`, which is what
+/// `code/modules/mapping/reader.dm` expects when it parses tiles back-to-front.
 fn layer_priority(path: &str) -> u8 {
-    if path.starts_with("/area") { 0 }
-    else if path.starts_with("/turf") { 1 }
-    else if path.starts_with("/obj") { 2 }
-    else if path.starts_with("/mob") { 3 }
+    if path.starts_with("/obj") { 0 }
+    else if path.starts_with("/mob") { 1 }
+    else if path.starts_with("/turf") { 2 }
+    else if path.starts_with("/area") { 3 }
     else { 4 }
 }
 

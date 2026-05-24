@@ -41,6 +41,12 @@ pub fn render_region(
     let y2 = y2.max(y1).min(dim_y);
 
     // Configure render passes
+    //
+    // Render pass mechanics: "include" enables specific passes, "exclude"
+    // disables them. The pseudo-keyword "all" matches every pass.
+    //
+    // "hide-areas" is enabled by default → areas are NOT rendered. To show
+    // areas, we EXCLUDE "hide-areas". The same trick works for "hide-space".
     let renderer_config = &state.renderer_config;
     let render_passes = match render_pass_filter {
         Some("pipes") => render_passes::configure(renderer_config, "only-pipenet", "all"),
@@ -48,6 +54,8 @@ pub fn render_region(
         Some("pipes-and-cables") | Some("wires-and-pipes") => {
             render_passes::configure(renderer_config, "only-wires-and-pipes", "all")
         }
+        Some("areas") => render_passes::configure(renderer_config, "", "hide-areas"),
+        Some("areas-only") => render_passes::configure(renderer_config, "", "hide-areas,hide-invisible,pretty,random,spawners,smoothing,smart-tile-borders"),
         Some(custom) => render_passes::configure(renderer_config, custom, ""),
         None => render_passes::configure(renderer_config, "", ""),
     };
@@ -99,6 +107,7 @@ pub fn render_area(
     state: &ServerState,
     area_path: &str,
     render_pass_filter: Option<&str>,
+    padding: Option<u32>,
 ) -> Result<Option<RenderResult>> {
     // Need to read index for bounding box, but render_region will also read.
     // We can't hold the lock across both calls (deadlock), so read bounds first.
@@ -123,7 +132,7 @@ pub fn render_area(
             z = tz;
         }
 
-        let pad = 1;
+        let pad = padding.unwrap_or(1) as i32;
         min_x = (min_x - pad).max(1);
         min_y = (min_y - pad).max(1);
         max_x = (max_x + pad).min(map_data.index.dim_x as i32);
