@@ -226,6 +226,77 @@ impl RuleEngine {
 
                     total_rules += 1;
 
+                    // Area-anchor rules iterate over AREAS instead of object instances.
+                    // An anchor starting with "/area/" matches every area whose path is
+                    // a subtype of the anchor. The "object" passed to check() is a
+                    // descriptor of the area with tile list and centroid.
+                    let is_area_rule = anchor.starts_with("/area");
+                    if is_area_rule {
+                        // Collect matching areas (prefix match, like type anchors)
+                        let area_paths: Vec<String> = index.all_areas()
+                            .into_iter()
+                            .filter(|p| p.starts_with(&anchor))
+                            .map(|s| s.to_string())
+                            .collect();
+                        total_anchors += area_paths.len();
+
+                        for area_path in area_paths {
+                            let tiles = index.area_tiles(&area_path);
+                            if tiles.is_empty() { continue; }
+
+                            // Compute centroid + bbox + a representative z
+                            let n = tiles.len() as f64;
+                            let mut sx = 0i64; let mut sy = 0i64;
+                            let (mut minx, mut miny) = (i32::MAX, i32::MAX);
+                            let (mut maxx, mut maxy) = (i32::MIN, i32::MIN);
+                            let mut z_rep = 1i32;
+                            for &(x, y, z) in tiles {
+                                sx += x as i64; sy += y as i64;
+                                if x < minx { minx = x; } if x > maxx { maxx = x; }
+                                if y < miny { miny = y; } if y > maxy { maxy = y; }
+                                z_rep = z;
+                            }
+                            let cx = (sx as f64 / n).round() as i32;
+                            let cy = (sy as f64 / n).round() as i32;
+
+                            let area_json = serde_json::json!({
+                                "path": area_path,
+                                "tiles": tiles.iter().map(|&(x,y,z)| serde_json::json!([x,y,z])).collect::<Vec<_>>(),
+                                "tile_count": tiles.len(),
+                                "centroid": { "x": cx, "y": cy, "z": z_rep },
+                                "bbox": { "x1": minx, "y1": miny, "x2": maxx, "y2": maxy },
+                                "z": z_rep,
+                                "x": cx, "y": cy,  // for {x}/{y}/{z} message substitution
+                            });
+                            let obj_val = json_to_js(&ctx, &area_json)?;
+                            let ctx_val: rquickjs::Value = ctx.globals().get("__ctx")?;
+                            let result: rquickjs::Value = match check_fn.call((obj_val, ctx_val)) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    all_errors.push(format!(
+                                        "Rule '{}' threw on area '{}': {}",
+                                        rule_id, area_path, e
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let violation_message = interpret_check_result(&result, &default_message);
+                            if let Some(msg) = violation_message {
+                                all_violations.push(Violation {
+                                    rule_id: rule_id.clone(),
+                                    severity: severity.clone(),
+                                    message: msg.replace("{x}", &cx.to_string())
+                                        .replace("{y}", &cy.to_string())
+                                        .replace("{z}", &z_rep.to_string())
+                                        .replace("{area}", &area_path),
+                                    x: cx, y: cy, z: z_rep,
+                                    anchor_path: area_path.clone(),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+
                     // Get all anchor instances from the spatial index
                     let instances = index.instances_of(&anchor);
                     total_anchors += instances.len();

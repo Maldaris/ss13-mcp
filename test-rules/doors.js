@@ -13,6 +13,8 @@ rule("airlock-not-in-space", {
   }
 });
 
+
+
 rule("airlock-borders-two-areas", {
   anchor: "/obj/machinery/door/airlock",
   severity: "info",
