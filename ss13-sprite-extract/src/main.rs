@@ -1,0 +1,407 @@
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context as _, Result};
+use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
+use serde::Serialize;
+use tracing::{info, debug};
+
+use dreammaker::constants::Constant;
+use dreammaker::dmi::{Dir, Dirs, StateIndex};
+use dreammaker::objtree::TypeRef;
+use dmm_tools::dmi::Image;
+use dmm_tools::IconCache;
+
+mod walker;
+
+/// Extract sprite corpus with semantic metadata from SS13 codebases
+#[derive(Parser, Debug)]
+#[command(name = "sprite-extract", version, about)]
+struct Args {
+    /// Path to the .dme file
+    #[arg()]
+    dme_path: PathBuf,
+
+    /// Output directory for extracted sprites
+    #[arg(short, long, default_value = "output")]
+    output: PathBuf,
+
+    /// Only extract types matching this prefix (e.g. "/obj/machinery")
+    #[arg(short, long)]
+    filter: Option<String>,
+
+    /// Skip types with no icon defined
+    #[arg(long, default_value_t = true)]
+    skip_no_icon: bool,
+
+    /// Extract only first frame of animations
+    #[arg(long, default_value_t = true)]
+    first_frame_only: bool,
+}
+
+// ── Output structures ──────────────────────────────────────────────
+
+/// Metadata for a single DM type
+#[derive(Debug, Serialize)]
+struct TypeMeta {
+    type_path: String,
+    name: Option<String>,
+    desc: Option<String>,
+    parent_path: String,
+    parent_chain: Vec<String>,
+    icon_file: Option<String>,
+    icon_state: Option<String>,
+}
+
+/// Metadata for a unique DMI file
+#[derive(Debug, Serialize)]
+struct DmiMeta {
+    path: String,
+    width: u32,
+    height: u32,
+    state_count: usize,
+    states: Vec<String>,
+    sprite_dir: String,
+}
+
+/// A single extracted sprite file
+#[derive(Debug, Serialize)]
+struct SpriteEntry {
+    /// Relative path to the PNG within the output dir
+    file: String,
+    /// DMI source file
+    dmi_source: String,
+    /// State name within the DMI
+    state_name: String,
+    /// Direction
+    direction: String,
+    /// Frame index (0-based)
+    frame: usize,
+    /// Sprite width
+    width: u32,
+    /// Sprite height
+    height: u32,
+}
+
+/// Top-level corpus manifest
+#[derive(Debug, Serialize)]
+struct Manifest {
+    source_dme: String,
+    total_types: usize,
+    total_dmi_files: usize,
+    total_sprites: usize,
+    dmi_files: Vec<DmiMeta>,
+    types: Vec<TypeMeta>,
+    sprites: Vec<SpriteEntry>,
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "sprite_extract=info".into()),
+        )
+        .init();
+
+    let args = Args::parse();
+
+    // Parse the codebase
+    info!("Parsing {}...", args.dme_path.display());
+    let ctx = dreammaker::Context::default();
+    let dme_path = args.dme_path.canonicalize()
+        .context("Failed to canonicalize .dme path")?;
+
+    let pp = dreammaker::preprocessor::Preprocessor::new(&ctx, dme_path.clone())
+        .context("Failed to create preprocessor")?;
+    let indents = dreammaker::indents::IndentProcessor::new(&ctx, pp);
+    let parser = dreammaker::parser::Parser::new(&ctx, indents);
+    let objtree = parser.parse_object_tree();
+
+    let error_count = ctx.errors().iter().filter(|e| e.severity() == dreammaker::Severity::Error).count();
+    let warning_count = ctx.errors().iter().filter(|e| e.severity() == dreammaker::Severity::Warning).count();
+    info!("Parsed object tree: {} errors, {} warnings", error_count, warning_count);
+
+    // Set up icon cache
+    let codebase_root = dme_path.parent().unwrap_or(Path::new("."));
+    let mut icon_cache = IconCache::default();
+    icon_cache.set_icons_root(codebase_root);
+
+    // Walk the object tree
+    let types = walker::collect_extractable_types(&objtree, args.filter.as_deref());
+    info!("Found {} types to extract", types.len());
+
+    // Create output directory
+    std::fs::create_dir_all(&args.output)
+        .context("Failed to create output directory")?;
+    std::fs::create_dir_all(args.output.join("sprites"))
+        .context("Failed to create sprites directory")?;
+
+    // ── Phase 1: Collect all unique DMI files referenced by types ──
+    let pb = ProgressBar::new(types.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:60.cyan/blue} {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+
+    let mut type_metas: Vec<TypeMeta> = Vec::new();
+    let mut dmi_files_needed: HashSet<String> = HashSet::new();
+
+    for type_ref in &types {
+        let path = type_ref.get().path.clone();
+        pb.set_message(path.clone());
+
+        let icon_resource = resolve_var_string(type_ref, "icon");
+        let icon_state = resolve_var_string(type_ref, "icon_state");
+        let name = resolve_var_string(type_ref, "name");
+        let desc = resolve_var_string(type_ref, "desc");
+
+        let parent_chain = build_parent_chain(type_ref);
+        let parent_path = type_ref
+            .parent_type()
+            .map(|p| p.get().path.clone())
+            .unwrap_or_default();
+
+        if let Some(ref icon) = icon_resource {
+            dmi_files_needed.insert(icon.clone());
+        }
+
+        type_metas.push(TypeMeta {
+            type_path: path,
+            name,
+            desc,
+            parent_path,
+            parent_chain,
+            icon_file: icon_resource,
+            icon_state,
+        });
+
+        pb.inc(1);
+    }
+
+    pb.finish_with_message("Types collected");
+
+    // ── Phase 2: Extract all sprites from unique DMI files ──
+    info!("Extracting sprites from {} unique DMI files...", dmi_files_needed.len());
+    let pb2 = ProgressBar::new(dmi_files_needed.len() as u64);
+    pb2.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:60.green/blue} {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+
+    let mut all_sprites: Vec<SpriteEntry> = Vec::new();
+    let mut dmi_metas: Vec<DmiMeta> = Vec::new();
+    let mut extracted_count = 0usize;
+
+    for dmi_path_str in &dmi_files_needed {
+        pb2.set_message(dmi_path_str.clone());
+
+        let icon_path = Path::new(dmi_path_str.as_str());
+        let icon_file = match icon_cache.retrieve_uniq(icon_path) {
+            Some(f) => f,
+            None => {
+                debug!("Could not load DMI: {}", dmi_path_str);
+                pb2.inc(1);
+                continue;
+            }
+        };
+
+        // Create output subdir for this DMI file
+        let dmi_dir_name = sanitize_dmi_path(dmi_path_str);
+        let dmi_out_dir = args.output.join("sprites").join(&dmi_dir_name);
+        std::fs::create_dir_all(&dmi_out_dir)?;
+
+        // Extract every state
+        for state in &icon_file.metadata.states {
+            let dirs = match state.dirs {
+                Dirs::One => vec![Dir::South],
+                Dirs::Four => Dir::CARDINALS.to_vec(),
+                Dirs::Eight => Dir::ALL.to_vec(),
+            };
+
+            let frame_count = match &state.frames {
+                dreammaker::dmi::Frames::One => 1,
+                dreammaker::dmi::Frames::Count(n) => {
+                    if args.first_frame_only { 1 } else { *n }
+                }
+                dreammaker::dmi::Frames::Delays(d) => {
+                    if args.first_frame_only { 1 } else { d.len() }
+                }
+            };
+
+            for &dir in &dirs {
+                let dir_str = dir_to_string(dir);
+
+                for frame in 0..frame_count {
+                    let state_idx = StateIndex::from(state.name.as_str());
+                    let rect = match icon_file.metadata.rect_of(
+                        icon_file.image.width,
+                        &state_idx,
+                        dir,
+                        frame as u32,
+                    ) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+
+                    // Build filename
+                    let state_safe = sanitize_filename(&state.name);
+                    let filename = if frame_count > 1 {
+                        format!("{}_{}_f{}.png", state_safe, dir_str, frame)
+                    } else {
+                        format!("{}_{}.png", state_safe, dir_str)
+                    };
+
+                    let sprite_path = dmi_out_dir.join(&filename);
+
+                    // Extract and write the sprite
+                    let mut sprite = Image::new_rgba(
+                        icon_file.metadata.width,
+                        icon_file.metadata.height,
+                    );
+                    sprite.composite(
+                        &icon_file.image,
+                        (0, 0),
+                        rect,
+                        [255, 255, 255, 255],
+                    );
+                    sprite.to_file(&sprite_path)
+                        .with_context(|| format!("Failed to write {}", sprite_path.display()))?;
+
+                    let rel_path = format!("sprites/{}/{}", dmi_dir_name, filename);
+
+                    all_sprites.push(SpriteEntry {
+                        file: rel_path,
+                        dmi_source: dmi_path_str.clone(),
+                        state_name: state.name.clone(),
+                        direction: dir_str.to_string(),
+                        frame,
+                        width: icon_file.metadata.width,
+                        height: icon_file.metadata.height,
+                    });
+
+                    extracted_count += 1;
+                }
+            }
+        }
+
+        // Record DMI metadata
+        dmi_metas.push(DmiMeta {
+            path: dmi_path_str.clone(),
+            width: icon_file.metadata.width,
+            height: icon_file.metadata.height,
+            state_count: icon_file.metadata.states.len(),
+            states: icon_file.metadata.states.iter().map(|s| s.name.clone()).collect(),
+            sprite_dir: format!("sprites/{}", dmi_dir_name),
+        });
+
+        pb2.inc(1);
+    }
+
+    pb2.finish_with_message("Sprites extracted");
+
+    // ── Phase 3: Write output files ──
+
+    // Write types index (separate file — can be large)
+    let types_path = args.output.join("types.json");
+    std::fs::write(&types_path, serde_json::to_string(&type_metas)?)?;
+
+    // Write sprites index (separate file)
+    let sprites_path = args.output.join("sprites.json");
+    std::fs::write(&sprites_path, serde_json::to_string(&all_sprites)?)?;
+
+    // Write compact manifest (summary + DMI index only)
+    let manifest = Manifest {
+        source_dme: args.dme_path.display().to_string(),
+        total_types: type_metas.len(),
+        total_dmi_files: dmi_files_needed.len(),
+        total_sprites: extracted_count,
+        dmi_files: dmi_metas,
+        types: Vec::new(),    // types are in types.json
+        sprites: Vec::new(),  // sprites are in sprites.json
+    };
+
+    let manifest_path = args.output.join("manifest.json");
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+
+    info!(
+        "Done! {} types, {} DMIs, {} sprites → {}",
+        manifest.total_types,
+        manifest.total_dmi_files,
+        manifest.total_sprites,
+        manifest_path.display()
+    );
+
+    Ok(())
+}
+
+/// Resolve a string var through the type inheritance chain
+fn resolve_var_string(type_ref: &TypeRef, var_name: &str) -> Option<String> {
+    let mut current = Some(*type_ref);
+    while let Some(ty) = current {
+        if let Some(var_val) = ty.get().vars.get(var_name) {
+            if let Some(ref constant) = var_val.value.constant {
+                match constant {
+                    Constant::String(s) => return Some(s.to_string()),
+                    Constant::Resource(r) => return Some(r.to_string()),
+                    Constant::Null(_) => return None,
+                    _ => {}
+                }
+            }
+        }
+        current = ty.parent_type();
+    }
+    None
+}
+
+/// Build the parent type chain as a list of path strings
+fn build_parent_chain(type_ref: &TypeRef) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = type_ref.parent_type();
+    while let Some(ty) = current {
+        let path = ty.get().path.clone();
+        if path.is_empty() {
+            break;
+        }
+        chain.push(path);
+        current = ty.parent_type();
+    }
+    chain
+}
+
+fn dir_to_string(dir: Dir) -> &'static str {
+    match dir {
+        Dir::North => "north",
+        Dir::South => "south",
+        Dir::East => "east",
+        Dir::West => "west",
+        Dir::Northeast => "northeast",
+        Dir::Northwest => "northwest",
+        Dir::Southeast => "southeast",
+        Dir::Southwest => "southwest",
+    }
+}
+
+fn sanitize_filename(s: &str) -> String {
+    if s.is_empty() {
+        return "default".to_string();
+    }
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            ' ' => '_',
+            c => c,
+        })
+        .collect()
+}
+
+/// Convert a DMI path like "icons/obj/machines/power.dmi" into a safe directory name
+fn sanitize_dmi_path(s: &str) -> String {
+    s.trim_end_matches(".dmi")
+        .replace('/', "__")
+        .replace('\\', "__")
+}

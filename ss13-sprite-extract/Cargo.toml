@@ -1,0 +1,34 @@
+[package]
+name = "ss13-sprite-extract"
+version = "0.1.0"
+edition = "2021"
+description = "Extract sprite corpus with semantic metadata from SS13 codebases for LoRA training"
+
+[[bin]]
+name = "sprite-extract"
+path = "src/main.rs"
+
+[dependencies]
+# SpacemanDMM crates — shared with ss13-map-mcp
+dreammaker = { path = "../spacemandmm-patched/crates/dreammaker" }
+dmm-tools = { path = "../spacemandmm-patched/crates/dmm-tools", features = ["png"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Progress bars
+indicatif = "0.17"
+
+# Parallel iteration
+rayon = "1"
