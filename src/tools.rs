@@ -6,6 +6,7 @@
 //! - `notifications/tools/list_changed` fires on every scope transition
 
 use std::sync::Arc;
+use dmm_tools::dmm::Map;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{ServerHandler, schemars, tool, tool_router};
@@ -16,7 +17,22 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use crate::builder::BuilderScopeStack;
-use crate::state::ServerState;
+use crate::state::{MapData, ServerState};
+
+/// Upper bound on a generated map's axis, so a fat-fingered dimension cannot
+/// ask for a grid that exhausts memory.
+const MAX_MAP_DIMENSION: usize = 512;
+
+/// Refuse a map swap that would throw away staged edits.
+fn unsaved_changes_block(map_data: &MapData, discard: Option<bool>) -> Option<String> {
+    if !map_data.dirty || discard.unwrap_or(false) {
+        return None;
+    }
+    Some(format!(
+        "❌ {} has unsaved changes. Call save_map first, or pass discard_changes: true to abandon them.",
+        map_data.path.display()
+    ))
+}
 
 // ── Tool parameter types ─────────────────────────────────────────────
 
@@ -136,6 +152,50 @@ pub struct RenderAreaParams {
 pub struct SaveMapParams {
     /// Output file path. If omitted, overwrites the loaded map file.
     pub path: Option<String>,
+    /// Rebuild and dedupe the dictionary instead of preserving on-disk layout.
+    pub compact: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetTurfParams {
+    /// X coordinate (1-based)
+    pub x: i32,
+    /// Y coordinate (1-based)
+    pub y: i32,
+    /// Z level (default 1)
+    pub z: Option<i32>,
+    /// Turf type path (must start with /turf/)
+    pub type_path: String,
+    /// Optional variable overrides as JSON object
+    pub vars: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateMapParams {
+    /// Path to write the new .dmm to (e.g. "_maps/shuttles/example/thing.dmm")
+    pub path: String,
+    /// Width in tiles
+    pub width: usize,
+    /// Height in tiles
+    pub height: usize,
+    /// Number of z levels (default 1)
+    pub levels: Option<usize>,
+    /// Turf every tile starts as (default "/turf/open/space")
+    pub base_turf: Option<String>,
+    /// Area every tile starts in (default "/area/space")
+    pub base_area: Option<String>,
+    /// Replace an existing file at `path` (default false)
+    pub overwrite: Option<bool>,
+    /// Abandon unsaved edits to the current map (default false)
+    pub discard_changes: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OpenMapParams {
+    /// Path of the .dmm to open
+    pub path: String,
+    /// Abandon unsaved edits to the current map (default false)
+    pub discard_changes: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -635,28 +695,112 @@ impl StaticTools {
     }
 
     /// Save the map to a file (overwrite or new path).
-    #[tool(description = "Save the current map state to a .dmm file. Without a path, overwrites the loaded file. Returns the number of dictionary entries.")]
+    #[tool(description = "Save the current map state to a .dmm file. Without a path, overwrites the active map file. By default preserves the loaded file's layout and key names. Pass compact: true to rebuild and dedupe the dictionary.")]
     async fn save_map(&self, Parameters(params): Parameters<SaveMapParams>) -> String {
+        let mut map_data = self.state.map_data.write().await;
+
         let save_path = params.path
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| self.state.dmm_path.clone());
+            .unwrap_or_else(|| map_data.path.clone());
 
-        let mut map_data = self.state.map_data.write().await;
-        
-        if !map_data.dirty {
-            return format!("Map has no unsaved changes. Save path would be: {}", save_path.display());
-        }
+        let compact = params.compact.unwrap_or(false);
 
-        match map_data.save(&save_path) {
+        match map_data.save(&save_path, compact) {
             Ok(()) => {
                 let dict_size = map_data.map.dictionary.len();
                 format!(
-                    "✅ Map saved to: {}\n  {} dictionary entries\n  Map marked clean.",
-                    save_path.display(), dict_size
+                    "✅ Map saved to: {}\n  {} dictionary entries\n  Map marked clean{}.",
+                    save_path.display(),
+                    dict_size,
+                    if compact { " (compact rebuild)" } else { "" },
                 )
             }
             Err(e) => format!("❌ Save failed: {}", e),
         }
+    }
+
+    /// Create a blank map and make it the active one.
+    #[tool(description = "Create a new blank .dmm of the given size, write it to disk, and make it the map every other tool operates on. Every tile starts as base_turf inside base_area.")]
+    async fn create_map(&self, Parameters(params): Parameters<CreateMapParams>) -> String {
+        let levels = params.levels.unwrap_or(1);
+        let base_turf = params.base_turf.unwrap_or_else(|| "/turf/open/space".to_string());
+        let base_area = params.base_area.unwrap_or_else(|| "/area/space".to_string());
+
+        if params.width == 0 || params.height == 0 || levels == 0 {
+            return "❌ Every dimension must be at least 1 tile".to_string();
+        }
+        if params.width > MAX_MAP_DIMENSION || params.height > MAX_MAP_DIMENSION || levels > MAX_MAP_DIMENSION {
+            return format!("❌ Dimensions are capped at {} per axis", MAX_MAP_DIMENSION);
+        }
+        if !base_turf.starts_with("/turf/") {
+            return format!("❌ base_turf '{}' is not a turf path", base_turf);
+        }
+        if !base_area.starts_with("/area") {
+            return format!("❌ base_area '{}' is not an area path", base_area);
+        }
+        for path in [&base_turf, &base_area] {
+            if crate::builder::find_type(&self.state.objtree, path).is_none() {
+                return format!("❌ '{}' does not exist in this environment", path);
+            }
+        }
+
+        let target = std::path::PathBuf::from(&params.path);
+        if target.exists() && !params.overwrite.unwrap_or(false) {
+            return format!(
+                "❌ {} already exists. Pass overwrite: true to replace it, or open_map to edit it.",
+                target.display()
+            );
+        }
+
+        let mut map_data = self.state.map_data.write().await;
+        if let Some(blocked) = unsaved_changes_block(&map_data, params.discard_changes) {
+            return blocked;
+        }
+
+        if let Some(parent) = target.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return format!("❌ Could not create {}: {}", parent.display(), e);
+                }
+            }
+        }
+
+        let map = Map::new(params.width, params.height, levels, base_turf.clone(), base_area.clone());
+        if let Err(e) = map.to_file(&target) {
+            return format!("❌ Could not write {}: {}", target.display(), e);
+        }
+        map_data.activate_new(map, target.clone());
+
+        format!(
+            "✅ Created {} ({}x{}x{})\n  Every tile: {} in {}\n  This is now the active map.",
+            target.display(), params.width, params.height, levels, base_turf, base_area
+        )
+    }
+
+    /// Open an existing map file and make it the active one.
+    #[tool(description = "Open an existing .dmm and make it the map every other tool operates on. Accepts standard DMM or TGM format.")]
+    async fn open_map(&self, Parameters(params): Parameters<OpenMapParams>) -> String {
+        let target = std::path::PathBuf::from(&params.path);
+        if !target.is_file() {
+            return format!("❌ No such map file: {}", target.display());
+        }
+
+        let mut map_data = self.state.map_data.write().await;
+        if let Some(blocked) = unsaved_changes_block(&map_data, params.discard_changes) {
+            return blocked;
+        }
+
+        let map = match Map::from_file(&target) {
+            Ok(map) => map,
+            Err(e) => return format!("❌ Could not parse {}: {}", target.display(), e),
+        };
+        let (dim_x, dim_y, dim_z) = map.dim_xyz();
+        map_data.activate(map, target.clone());
+
+        format!(
+            "✅ Opened {} ({}x{}x{})\n  {} areas indexed.\n  This is now the active map.",
+            target.display(), dim_x, dim_y, dim_z, map_data.index.all_areas().len()
+        )
     }
 
     /// Place a prefab directly on a map tile.
@@ -717,6 +861,32 @@ impl StaticTools {
             Ok(true) => format!("✅ Removed '{}' from ({},{},{})", params.type_path, params.x, params.y, z),
             Ok(false) => format!("⚠ '{}' not found at ({},{},{})", params.type_path, params.x, params.y, z),
             Err(e) => format!("❌ Remove failed: {}", e),
+        }
+    }
+
+    /// Replace the turf on a map tile.
+    #[tool(description = "Replace the turf on a map tile. Provide a /turf/... type path and optional var overrides matching place_prefab's vars convention.")]
+    async fn set_turf(&self, Parameters(params): Parameters<SetTurfParams>) -> String {
+        let z = params.z.unwrap_or(1);
+        let vars = params.vars.map(|vm| {
+            let mut map = std::collections::BTreeMap::new();
+            for (k, v) in vm {
+                map.insert(k, v);
+            }
+            map
+        });
+
+        let mut map_data = self.state.map_data.write().await;
+
+        let (dim_x, dim_y, dim_z) = (map_data.index.dim_x, map_data.index.dim_y, map_data.index.dim_z);
+        if params.x < 1 || params.x > dim_x as i32 || params.y < 1 || params.y > dim_y as i32 || z < 1 || z > dim_z as i32 {
+            return format!("❌ Coordinates ({},{},{}) out of bounds ({}x{}x{})",
+                params.x, params.y, z, dim_x, dim_y, dim_z);
+        }
+
+        match map_data.set_turf(params.x, params.y, z, &params.type_path, vars.as_ref(), &self.state.objtree) {
+            Ok(()) => format!("✅ Turf set at ({},{},{}): {}", params.x, params.y, z, params.type_path),
+            Err(e) => format!("❌ set_turf failed: {}", e),
         }
     }
 
@@ -811,7 +981,12 @@ impl ServerHandler for MapTools {
                  - `discard()` — pop scope without saving\n\n\
                  ## Map Mutation\n\
                  When committing a root scope, provide x,y,z to place the prefab on a tile.\n\
-                 Use `save_map()` to write changes to disk. Changes are tracked (dirty flag).\n\n\
+                 Use `set_turf(x, y, z, type_path)` to replace a tile's turf.\n\
+                 Use `save_map()` to write changes to disk (preserves on-disk layout by default; pass compact: true to rebuild).\n\n\
+                 ## Switching Maps\n\
+                 `create_map(path, width, height)` makes a blank map and activates it; \
+                 `open_map(path)` activates an existing one. Both refuse to drop unsaved edits \
+                 unless passed `discard_changes: true`. Everything else operates on the active map.\n\n\
                  The tool list changes on every scope transition. Only one scope is visible at a time."
                 .into()
             ),
