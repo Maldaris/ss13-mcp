@@ -5,9 +5,12 @@ edition = "2021"
 description = "MCP server for SS13 map intelligence — spatial queries, validation rules, and AI-assisted mapping"
 
 [dependencies]
-# SpacemanDMM crates (DM parser + map tools)
-# Using local patched copy — fixes smoothing_flags constant mismatch with current tgstation.
-# TG moved SMOOTH_BITMASK from bit 1 to bit 0; upstream SpacemanDMM still has old layout.
+# SpacemanDMM crates (DM parser + map tools).
+#
+# These are paths into the `spacemandmm-patched` submodule rather than a git
+# dependency, so an edit to the parser or the map writer is picked up by the
+# next `cargo build` instead of needing a push and a re-pin. Run
+# `git submodule update --init` after cloning or the paths will not exist.
 dreammaker = { path = "spacemandmm-patched/crates/dreammaker" }
 dmm-tools = { path = "spacemandmm-patched/crates/dmm-tools", features = ["png"] }
 

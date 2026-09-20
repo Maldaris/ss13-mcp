@@ -1,0 +1,4 @@
+[submodule "spacemandmm-patched"]
+	path = spacemandmm-patched
+	url = https://github.com/Maldaris/SpacemanDMM
+	branch = blastwave-patches
